@@ -41,6 +41,9 @@
 #define DEMO_DEFAULT_SYNCOPATION_PROBABILITY 0.10f
 #define DEMO_DEFAULT_FILL_PROBABILITY        0.25f
 #define DEMO_DEFAULT_SWAP_PROBABILITY        0.0f
+#define DEMO_DEFAULT_REVERSE_PROBABILITY     0.0f
+#define DEMO_OSC_FREQ_MIN_HZ                 20.0f
+#define DEMO_OSC_FREQ_MAX_HZ                 20000.0f
 #define DEMO_KICK_VELOCITY                   120
 #define DEMO_SNARE_VELOCITY                  118
 #define DEMO_HH_VELOCITY                     110
@@ -130,6 +133,86 @@ static int parse_float_value(const char *text, float *out_value) {
 
 static float db_to_gain(float db) {
   return powf(10.0f, db / 20.0f);
+}
+
+static void reverse_patch_attack_decay(po32_patch_params_t *params) {
+  float tmp = params->OscAtk;
+  params->OscAtk = params->OscDcy;
+  params->OscDcy = tmp;
+
+  tmp = params->NEnvAtk;
+  params->NEnvAtk = params->NEnvDcy;
+  params->NEnvDcy = tmp;
+}
+
+static float osc_param_to_hz(float param) {
+  float clamped = param;
+  if (clamped < 0.0f)
+    clamped = 0.0f;
+  if (clamped > 1.0f)
+    clamped = 1.0f;
+  return DEMO_OSC_FREQ_MIN_HZ * powf(1000.0f, clamped);
+}
+
+static float hz_to_osc_param(float hz) {
+  float clamped = hz;
+  if (clamped < DEMO_OSC_FREQ_MIN_HZ)
+    clamped = DEMO_OSC_FREQ_MIN_HZ;
+  if (clamped > DEMO_OSC_FREQ_MAX_HZ)
+    clamped = DEMO_OSC_FREQ_MAX_HZ;
+  return logf(clamped / DEMO_OSC_FREQ_MIN_HZ) / logf(1000.0f);
+}
+
+static float midi_to_hz(float midi_note) {
+  return 440.0f * powf(2.0f, (midi_note - 69.0f) / 12.0f);
+}
+
+static float hz_to_midi(float hz) {
+  return 69.0f + 12.0f * (logf(hz / 440.0f) / logf(2.0f));
+}
+
+static int pitch_class_mod12(int note) {
+  int pc = note % 12;
+  return pc < 0 ? pc + 12 : pc;
+}
+
+static int nearest_midi_for_pitch_class(float midi_note, int pitch_class, int min_note,
+                                        int max_note) {
+  int k_center = (int)lroundf((midi_note - (float)pitch_class) / 12.0f);
+  int best = min_note;
+  float best_dist = 1e9f;
+
+  for (int dk = -3; dk <= 3; ++dk) {
+    int candidate = pitch_class + 12 * (k_center + dk);
+    float dist;
+    if (candidate < min_note || candidate > max_note)
+      continue;
+    dist = fabsf(midi_note - (float)candidate);
+    if (dist < best_dist) {
+      best_dist = dist;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+static void quantize_patch_oscfreq_to_root_fifth(po32_patch_params_t *params, int root_midi_note) {
+  int root_pc = pitch_class_mod12(root_midi_note);
+  int fifth_pc = (root_pc + 7) % 12;
+  float original_hz = osc_param_to_hz(params->OscFreq);
+  float original_midi = hz_to_midi(original_hz);
+  float min_midi = hz_to_midi(DEMO_OSC_FREQ_MIN_HZ);
+  float max_midi = hz_to_midi(DEMO_OSC_FREQ_MAX_HZ);
+  int min_note = (int)ceilf(min_midi);
+  int max_note = (int)floorf(max_midi);
+  int root_candidate = nearest_midi_for_pitch_class(original_midi, root_pc, min_note, max_note);
+  int fifth_candidate = nearest_midi_for_pitch_class(original_midi, fifth_pc, min_note, max_note);
+  float root_dist = fabsf(original_midi - (float)root_candidate);
+  float fifth_dist = fabsf(original_midi - (float)fifth_candidate);
+  int selected_midi = (root_dist <= fifth_dist) ? root_candidate : fifth_candidate;
+  float quantized_hz = midi_to_hz((float)selected_midi);
+
+  params->OscFreq = hz_to_osc_param(quantized_hz);
 }
 
 static uint8_t random_fill_length(void) {
@@ -723,8 +806,8 @@ static float lerp01(float a, float b, float t) {
 static void print_usage(const char *program_name) {
   fprintf(stderr,
           "usage: %s [--sample-rate 96000] [--bpm 160] [--num 8] [--fill 0.25] "
-          "[--syncopation 0.1] [--swap-prob 0.0] [--kick -3] [--snare -2] [--hihat -6] "
-          "[--any -4] [output.wav] "
+          "[--syncopation 0.1] [--swap-prob 0.0] [--reverse 0.0] [--note 36] "
+          "[--kick -3] [--snare -2] [--hihat -6] [--any -4] [output.wav] "
           "[kick_patch.mtdrum] [snare_patch.mtdrum] [hh_a.mtdrum] [hh_b.mtdrum] "
           "[any_a.mtdrum] [any_b.mtdrum]\n",
           program_name);
@@ -738,6 +821,9 @@ static void print_usage(const char *program_name) {
           (double)DEMO_DEFAULT_SYNCOPATION_PROBABILITY);
   fprintf(stderr, "  --swap-prob must be between 0.0 and 1.0 (default %.2f)\n",
           (double)DEMO_DEFAULT_SWAP_PROBABILITY);
+  fprintf(stderr, "  --reverse must be between 0.0 and 1.0 (default %.2f)\n",
+          (double)DEMO_DEFAULT_REVERSE_PROBABILITY);
+  fprintf(stderr, "  --note must be MIDI note 0..127 (quantizes OscFreq to root/fifth)\n");
   fprintf(stderr, "  --kick/--snare/--hihat/--any are dB trims (default 0.0 dB)\n");
 }
 
@@ -792,6 +878,9 @@ int main(int argc, char **argv) {
   float fill_probability = DEMO_DEFAULT_FILL_PROBABILITY;
   float syncopation_probability = DEMO_DEFAULT_SYNCOPATION_PROBABILITY;
   float swap_probability = DEMO_DEFAULT_SWAP_PROBABILITY;
+  float reverse_probability = DEMO_DEFAULT_REVERSE_PROBABILITY;
+  int note_enabled = 0;
+  int note_midi = 0;
   float kick_db = 0.0f;
   float snare_db = 0.0f;
   float hihat_db = 0.0f;
@@ -835,6 +924,7 @@ int main(int argc, char **argv) {
   size_t hihat_b_swaps = 0u;
   size_t any_a_swaps = 0u;
   size_t any_b_swaps = 0u;
+  size_t reversed_steps = 0u;
   morph_endpoint_t kick_prev_endpoint = morph_endpoint_from_value(kick_morph_for_step(0u));
   morph_endpoint_t snare_prev_endpoint = morph_endpoint_from_value(snare_morph_for_step(0u));
   morph_endpoint_t hihat_prev_endpoint = morph_endpoint_from_value(hh_morph_for_step(0u));
@@ -962,6 +1052,69 @@ int main(int argc, char **argv) {
         return 1;
       }
       swap_probability = parsed;
+      continue;
+    }
+
+    if (strcmp(arg, "--reverse") == 0 || strcmp(arg, "--reverse-prob") == 0) {
+      float parsed = 0.0f;
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "missing value for %s\n", arg);
+        print_usage(argv[0]);
+        return 1;
+      }
+      if (!parse_float_value(argv[++argi], &parsed) || parsed < 0.0f || parsed > 1.0f) {
+        fprintf(stderr, "invalid %s value: %s\n", arg, argv[argi]);
+        print_usage(argv[0]);
+        return 1;
+      }
+      reverse_probability = parsed;
+      continue;
+    }
+
+    if (strncmp(arg, "--reverse=", 10u) == 0 || strncmp(arg, "--reverse-prob=", 15u) == 0) {
+      const char *value = NULL;
+      float parsed = 0.0f;
+      if (strncmp(arg, "--reverse=", 10u) == 0)
+        value = arg + 10;
+      else
+        value = arg + 15;
+      if (!parse_float_value(value, &parsed) || parsed < 0.0f || parsed > 1.0f) {
+        fprintf(stderr, "invalid reverse probability value: %s\n", value);
+        print_usage(argv[0]);
+        return 1;
+      }
+      reverse_probability = parsed;
+      continue;
+    }
+
+    if (strcmp(arg, "--note") == 0) {
+      long parsed = 0;
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "missing value for --note\n");
+        print_usage(argv[0]);
+        return 1;
+      }
+      parsed = strtol(argv[++argi], &endptr, 10);
+      if (endptr == argv[argi] || *endptr != '\0' || parsed < 0 || parsed > 127) {
+        fprintf(stderr, "invalid --note value: %s\n", argv[argi]);
+        print_usage(argv[0]);
+        return 1;
+      }
+      note_enabled = 1;
+      note_midi = (int)parsed;
+      continue;
+    }
+
+    if (strncmp(arg, "--note=", 7u) == 0) {
+      const char *value = arg + 7;
+      long parsed = strtol(value, &endptr, 10);
+      if (endptr == value || *endptr != '\0' || parsed < 0 || parsed > 127) {
+        fprintf(stderr, "invalid --note value: %s\n", value);
+        print_usage(argv[0]);
+        return 1;
+      }
+      note_enabled = 1;
+      note_midi = (int)parsed;
       continue;
     }
 
@@ -1390,7 +1543,11 @@ int main(int argc, char **argv) {
     float hihat_morph = hh_morph_for_step(step_index);
     float any_morph = any_morph_for_step(step_index);
     int is_silent_step = silence_steps[step_index] != 0u;
+    int reverse_step = chance_probability(reverse_probability);
     morph_endpoint_t endpoint;
+
+    if (reverse_step)
+      ++reversed_steps;
 
     endpoint = morph_endpoint_from_value(kick_morph);
     if (endpoint != MORPH_ENDPOINT_NONE && endpoint != kick_prev_endpoint) {
@@ -1477,6 +1634,10 @@ int main(int argc, char **argv) {
 
     if (kick_steps[step_index] != 0u) {
       interpolate_patch_params(&kick_a, &kick_b, kick_morph, &kick_step_patch);
+      if (note_enabled)
+        quantize_patch_oscfreq_to_root_fifth(&kick_step_patch, note_midi);
+      if (reverse_step)
+        reverse_patch_attack_decay(&kick_step_patch);
       status = po32_synth_render(&synth, &kick_step_patch, DEMO_KICK_VELOCITY, DEMO_HIT_SECONDS,
                                  kick_hit, hit_capacity, &kick_len);
       if (status != PO32_OK) {
@@ -1500,6 +1661,10 @@ int main(int argc, char **argv) {
 
     if (snare_steps[step_index] != 0u) {
       interpolate_patch_params(&snare_a, &snare_b, snare_morph, &snare_step_patch);
+      if (note_enabled)
+        quantize_patch_oscfreq_to_root_fifth(&snare_step_patch, note_midi);
+      if (reverse_step)
+        reverse_patch_attack_decay(&snare_step_patch);
       status = po32_synth_render(&synth, &snare_step_patch, DEMO_SNARE_VELOCITY, DEMO_HIT_SECONDS,
                                  snare_hit, hit_capacity, &snare_step_len);
       if (status != PO32_OK) {
@@ -1523,6 +1688,10 @@ int main(int argc, char **argv) {
 
     if (hihat_steps[step_index] != 0u) {
       interpolate_patch_params(&hh_a, &hh_b, hihat_morph, &hh_step_patch);
+      if (note_enabled)
+        quantize_patch_oscfreq_to_root_fifth(&hh_step_patch, note_midi);
+      if (reverse_step)
+        reverse_patch_attack_decay(&hh_step_patch);
       status = po32_synth_render(&synth, &hh_step_patch, DEMO_HH_VELOCITY, DEMO_HH_SECONDS, hh_hit,
                                  hh_capacity, &hh_len);
       if (status != PO32_OK) {
@@ -1546,6 +1715,10 @@ int main(int argc, char **argv) {
 
     if (is_any_step(step16)) {
       interpolate_patch_params(&any_a, &any_b, any_morph, &any_step_patch);
+      if (note_enabled)
+        quantize_patch_oscfreq_to_root_fifth(&any_step_patch, note_midi);
+      if (reverse_step)
+        reverse_patch_attack_decay(&any_step_patch);
       status = po32_synth_render(&synth, &any_step_patch, DEMO_ANY_VELOCITY, DEMO_ANY_SECONDS,
                                  any_hit, any_capacity, &any_len);
       if (status != PO32_OK) {
@@ -1620,6 +1793,14 @@ int main(int argc, char **argv) {
          silence_count, (unsigned)base_steps, (double)(syncopation_probability * 100.0f));
   printf("swap probability: %.1f%% when a morph endpoint is reached\n",
          (double)(swap_probability * 100.0f));
+  printf("reverse probability: %.1f%% per step (reversed steps: %zu/%u)\n",
+         (double)(reverse_probability * 100.0f), reversed_steps, (unsigned)total_steps);
+  if (note_enabled) {
+    printf("note quantize: MIDI %d root/fifth only (pitch classes %d and %d)\n", note_midi,
+           pitch_class_mod12(note_midi), (pitch_class_mod12(note_midi) + 7) % 12);
+  } else {
+    printf("note quantize: disabled\n");
+  }
   printf("mix trim: kick %.1f dB, snare %.1f dB, hihat %.1f dB, any %.1f dB\n", (double)kick_db,
          (double)snare_db, (double)hihat_db, (double)any_db);
   printf("kick patches: A=%s, B=%s (A swaps=%zu, B swaps=%zu)\n",
