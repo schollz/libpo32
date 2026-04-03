@@ -33,8 +33,10 @@
 #include <unistd.h>
 
 #define DEMO_SAMPLE_RATE    44100u
-#define DEMO_BASE_STEPS     64u
-#define DEMO_TOTAL_STEPS    128u
+#define DEMO_SEQUENCE_STEPS 16u
+#define DEMO_SEQUENCE_COUNT 4u
+#define DEMO_BASE_STEPS     (DEMO_SEQUENCE_STEPS * DEMO_SEQUENCE_COUNT)
+#define DEMO_TOTAL_STEPS    (DEMO_BASE_STEPS * 2u)
 #define DEMO_BPM            160.0f
 #define DEMO_KICK_VELOCITY  120
 #define DEMO_SNARE_VELOCITY 118
@@ -91,105 +93,138 @@ static int write_wav(const char *path, const float *samples, size_t sample_count
   return 1;
 }
 
-static int is_kick_step(uint8_t step_index) {
-  if (step_index >= 56u) {
-    /* 8-step fill: dense kicks driving back to step 1. */
-    switch (step_index) {
-    case 56u:
-    case 58u:
-    case 59u:
-    case 60u:
-    case 62u:
-    case 63u:
-      return 1;
-    default:
-      return 0;
+static int is_any_step(uint8_t step16) {
+  return step16 == 1u || step16 == 2u || step16 == 6u || step16 == 8u || step16 == 10u ||
+         step16 == 14u;
+}
+
+static int chance_percent(int percent) {
+  return (rand() % 100) < percent;
+}
+
+static uint8_t random_fill_length(void) {
+  switch (rand() % 3) {
+  case 0:
+    return 8u;
+  case 1:
+    return 12u;
+  default:
+    return 16u;
+  }
+}
+
+static void generate_step_patterns(uint8_t *kick_steps, uint8_t *snare_steps, uint8_t *hihat_steps,
+                                   uint8_t *fill_lengths, uint8_t *silence_steps) {
+  memset(kick_steps, 0, DEMO_BASE_STEPS);
+  memset(snare_steps, 0, DEMO_BASE_STEPS);
+  memset(hihat_steps, 0, DEMO_BASE_STEPS);
+  memset(silence_steps, 0, DEMO_BASE_STEPS);
+
+  for (uint8_t seq = 0u; seq < DEMO_SEQUENCE_COUNT; ++seq) {
+    size_t base = (size_t)seq * DEMO_SEQUENCE_STEPS;
+    uint8_t fill_len = 0u;
+
+    /* Jungle-ish 16-step backbone for this sequence. */
+    kick_steps[base + 0u] = 1u;
+    kick_steps[base + 7u] = 1u;
+    if (chance_percent(60))
+      kick_steps[base + 3u] = 1u;
+    if (chance_percent(55))
+      kick_steps[base + 10u] = 1u;
+    if (chance_percent(40))
+      kick_steps[base + 14u] = 1u;
+
+    snare_steps[base + 4u] = 1u;
+    snare_steps[base + 12u] = 1u;
+    if (chance_percent(35))
+      snare_steps[base + 2u] = 1u;
+    if (chance_percent(25))
+      snare_steps[base + 6u] = 1u;
+    if (chance_percent(30))
+      snare_steps[base + 14u] = 1u;
+
+    for (uint8_t s = 0u; s < DEMO_SEQUENCE_STEPS; ++s) {
+      if ((s % 2u) == 0u || chance_percent(35))
+        hihat_steps[base + s] = 1u;
+    }
+
+    /* 25% chance this 16-step block ends in a fill. */
+    if (chance_percent(25)) {
+      fill_len = random_fill_length();
+      for (uint8_t s = (uint8_t)(DEMO_SEQUENCE_STEPS - fill_len); s < DEMO_SEQUENCE_STEPS; ++s) {
+        size_t idx = base + s;
+        uint8_t rel = (uint8_t)(s - (DEMO_SEQUENCE_STEPS - fill_len));
+
+        hihat_steps[idx] = 1u;
+        if ((rel % 2u) == 0u || chance_percent(45))
+          kick_steps[idx] = 1u;
+        if ((rel % 2u) == 1u || chance_percent(65))
+          snare_steps[idx] = 1u;
+        if (chance_percent(25)) {
+          kick_steps[idx] = 1u;
+          snare_steps[idx] = 1u;
+        }
+      }
+
+      /* Force a strong handoff to the next sequence start. */
+      kick_steps[base + 15u] = 1u;
+      snare_steps[base + 15u] = 1u;
+      hihat_steps[base + 15u] = 1u;
+    }
+
+    fill_lengths[seq] = fill_len;
+  }
+
+  /* Post-pass syncopation: force true silent steps with 10% probability. */
+  for (size_t i = 0u; i < DEMO_BASE_STEPS; ++i) {
+    if (!chance_percent(10))
+      continue;
+    silence_steps[i] = 1u;
+    kick_steps[i] = 0u;
+    snare_steps[i] = 0u;
+    hihat_steps[i] = 0u;
+  }
+
+  /* Keep each 16-step phrase minimally populated. */
+  for (uint8_t seq = 0u; seq < DEMO_SEQUENCE_COUNT; ++seq) {
+    size_t base = (size_t)seq * DEMO_SEQUENCE_STEPS;
+    int has_kick = 0;
+    int has_snare = 0;
+    int has_hihat = 0;
+    for (uint8_t s = 0u; s < DEMO_SEQUENCE_STEPS; ++s) {
+      size_t idx = base + s;
+      has_kick |= kick_steps[idx] != 0u;
+      has_snare |= snare_steps[idx] != 0u;
+      has_hihat |= hihat_steps[idx] != 0u;
+    }
+    if (!has_kick) {
+      for (uint8_t s = 0u; s < DEMO_SEQUENCE_STEPS; ++s) {
+        size_t idx = base + s;
+        if (silence_steps[idx] == 0u) {
+          kick_steps[idx] = 1u;
+          break;
+        }
+      }
+    }
+    if (!has_snare) {
+      for (uint8_t s = 0u; s < DEMO_SEQUENCE_STEPS; ++s) {
+        size_t idx = base + s;
+        if (silence_steps[idx] == 0u) {
+          snare_steps[idx] = 1u;
+          break;
+        }
+      }
+    }
+    if (!has_hihat) {
+      for (uint8_t s = 0u; s < DEMO_SEQUENCE_STEPS; ++s) {
+        size_t idx = base + s;
+        if (silence_steps[idx] == 0u) {
+          hihat_steps[idx] = 1u;
+          break;
+        }
+      }
     }
   }
-
-  step_index = (uint8_t)(step_index % 32u);
-  switch (step_index) {
-  case 0u:
-  case 3u:
-  case 6u:
-  case 10u:
-  case 15u:
-  case 18u:
-  case 22u:
-  case 25u:
-  case 30u:
-    return 1;
-  default:
-    return 0;
-  }
-}
-
-static int is_snare_step(uint8_t step_index) {
-  if (step_index >= 56u) {
-    /* 8-step fill: snare barrage into the loop reset. */
-    switch (step_index) {
-    case 57u:
-    case 58u:
-    case 59u:
-    case 61u:
-    case 62u:
-    case 63u:
-      return 1;
-    default:
-      return 0;
-    }
-  }
-
-  step_index = (uint8_t)(step_index % 32u);
-  switch (step_index) {
-  case 4u:
-  case 11u:
-  case 12u:
-  case 20u:
-  case 27u:
-  case 28u:
-    return 1;
-  default:
-    return 0;
-  }
-}
-
-static int is_hihat_step(uint8_t step_index) {
-  if (step_index >= 56u) {
-    /* Keep hats busy in the fill section. */
-    return 1;
-  }
-
-  step_index = (uint8_t)(step_index % 32u);
-  switch (step_index) {
-  case 0u:
-  case 2u:
-  case 4u:
-  case 6u:
-  case 7u:
-  case 9u:
-  case 10u:
-  case 12u:
-  case 14u:
-  case 16u:
-  case 18u:
-  case 20u:
-  case 22u:
-  case 23u:
-  case 25u:
-  case 26u:
-  case 28u:
-  case 30u:
-  case 31u:
-    return 1;
-  default:
-    return 0;
-  }
-}
-
-static int is_any_step(uint8_t step_index) {
-  return step_index == 1u || step_index == 2u || step_index == 6u || step_index == 8u ||
-         step_index == 10u || step_index == 14u;
 }
 
 static void make_kick_patch(po32_patch_params_t *params) {
@@ -202,6 +237,22 @@ static void make_kick_patch(po32_patch_params_t *params) {
   params->ModAmt = 0.3f;
   params->Mix = 0.3f;
   params->Level = 0.836f;
+}
+
+static void make_kick_patch_b(po32_patch_params_t *params) {
+  po32_patch_params_zero(params);
+  params->OscWave = 0.5f;
+  params->OscFreq = 0.30f;
+  params->OscAtk = 0.0f;
+  params->OscDcy = 0.42f;
+  params->ModMode = 0.0f;
+  params->ModRate = 0.22f;
+  params->ModAmt = 0.20f;
+  params->NFilFrq = 0.40f;
+  params->NEnvDcy = 0.18f;
+  params->Mix = 0.42f;
+  params->DistAmt = 0.15f;
+  params->Level = 0.84f;
 }
 
 static void make_snare_patch(po32_patch_params_t *params) {
@@ -221,6 +272,25 @@ static void make_snare_patch(po32_patch_params_t *params) {
   params->Mix = 0.78f;
   params->DistAmt = 0.12f;
   params->Level = 0.82f;
+}
+
+static void make_snare_patch_b(po32_patch_params_t *params) {
+  po32_patch_params_zero(params);
+  params->OscWave = 1.0f;
+  params->OscFreq = 0.52f;
+  params->OscDcy = 0.14f;
+  params->ModMode = 0.0f;
+  params->ModRate = 0.34f;
+  params->ModAmt = 0.16f;
+  params->NFilMod = 1.0f;
+  params->NFilFrq = 0.76f;
+  params->NFilQ = 0.22f;
+  params->NEnvMod = 1.0f;
+  params->NEnvAtk = 0.0f;
+  params->NEnvDcy = 0.14f;
+  params->Mix = 0.86f;
+  params->DistAmt = 0.18f;
+  params->Level = 0.80f;
 }
 
 static void make_hh_patch_a(po32_patch_params_t *params) {
@@ -425,6 +495,11 @@ static int pick_random_kick_patch(char *out_path, size_t out_path_capacity) {
   return pick_random_patch(out_path, out_path_capacity, name_looks_like_kick, NULL);
 }
 
+static int pick_random_kick_patch_excluding(char *out_path, size_t out_path_capacity,
+                                            const char *exclude_full_path) {
+  return pick_random_patch(out_path, out_path_capacity, name_looks_like_kick, exclude_full_path);
+}
+
 static int pick_random_snare_patch(char *out_path, size_t out_path_capacity,
                                    const char *exclude_full_path) {
   return pick_random_patch(out_path, out_path_capacity, name_looks_like_snare, exclude_full_path);
@@ -527,6 +602,24 @@ static float hh_morph_for_step(uint8_t step_index) {
   return (float)(8u - phase) / 4.0f;
 }
 
+static float kick_morph_for_step(size_t step_index) {
+  const uint8_t period_steps = 12u; /* 3 beats at 16th-note resolution */
+  const uint8_t half_period = period_steps / 2u;
+  uint8_t phase = (uint8_t)(step_index % period_steps);
+  if (phase <= half_period)
+    return (float)phase / (float)half_period;
+  return (float)(period_steps - phase) / (float)half_period;
+}
+
+static float snare_morph_for_step(size_t step_index) {
+  const uint8_t half_period = 7u; /* 7 steps up, 7 steps down */
+  const uint8_t period_steps = (uint8_t)(half_period * 2u);
+  uint8_t phase = (uint8_t)(step_index % period_steps);
+  if (phase <= half_period)
+    return (float)phase / (float)half_period;
+  return (float)(period_steps - phase) / (float)half_period;
+}
+
 static float any_morph_for_step(uint8_t step_index) {
   uint8_t phase = (uint8_t)(step_index % 8u);
   return (float)phase / 7.0f;
@@ -565,34 +658,44 @@ static void interpolate_patch_params(const po32_patch_params_t *a, const po32_pa
 
 int main(int argc, char **argv) {
   const char *wav_path = "demo_kick_160bpm.wav";
-  const char *kick_patch_arg = NULL;
-  const char *snare_patch_arg = NULL;
+  const char *kick_patch_a_arg = NULL;
+  const char *kick_patch_b_arg = NULL;
+  const char *snare_patch_a_arg = NULL;
+  const char *snare_patch_b_arg = NULL;
   const char *hh_patch_a_arg = NULL;
   const char *hh_patch_b_arg = NULL;
   const char *any_patch_a_arg = NULL;
   const char *any_patch_b_arg = NULL;
 
-  char random_kick_patch_path[DEMO_PATH_MAX];
-  char random_snare_patch_path[DEMO_PATH_MAX];
+  char random_kick_patch_a_path[DEMO_PATH_MAX];
+  char random_kick_patch_b_path[DEMO_PATH_MAX];
+  char random_snare_patch_a_path[DEMO_PATH_MAX];
+  char random_snare_patch_b_path[DEMO_PATH_MAX];
   char random_hh_patch_a_path[DEMO_PATH_MAX];
   char random_hh_patch_b_path[DEMO_PATH_MAX];
   char random_any_patch_a_path[DEMO_PATH_MAX];
   char random_any_patch_b_path[DEMO_PATH_MAX];
 
-  int using_random_kick_patch = 0;
-  int using_random_snare_patch = 0;
+  int using_random_kick_patch_a = 0;
+  int using_random_kick_patch_b = 0;
+  int using_random_snare_patch_a = 0;
+  int using_random_snare_patch_b = 0;
   int using_random_hh_patch_a = 0;
   int using_random_hh_patch_b = 0;
   int using_random_any_patch_a = 0;
   int using_random_any_patch_b = 0;
 
   po32_synth_t synth;
-  po32_patch_params_t kick;
-  po32_patch_params_t snare;
+  po32_patch_params_t kick_a;
+  po32_patch_params_t kick_b;
+  po32_patch_params_t snare_a;
+  po32_patch_params_t snare_b;
   po32_patch_params_t hh_a;
   po32_patch_params_t hh_b;
   po32_patch_params_t any_a;
   po32_patch_params_t any_b;
+  po32_patch_params_t kick_step_patch;
+  po32_patch_params_t snare_step_patch;
   po32_patch_params_t hh_step_patch;
   po32_patch_params_t any_step_patch;
   po32_status_t status;
@@ -604,11 +707,17 @@ int main(int argc, char **argv) {
   size_t hh_capacity;
   size_t any_capacity;
   size_t kick_len = 0u;
-  size_t snare_len = 0u;
+  size_t snare_step_len = 0u;
   size_t hh_len = 0u;
   size_t any_len = 0u;
   size_t longest_hit_len;
   size_t output_len;
+  uint8_t kick_steps[DEMO_BASE_STEPS];
+  uint8_t snare_steps[DEMO_BASE_STEPS];
+  uint8_t hihat_steps[DEMO_BASE_STEPS];
+  uint8_t silence_steps[DEMO_BASE_STEPS];
+  uint8_t fill_lengths[DEMO_SEQUENCE_COUNT];
+  size_t silence_count = 0u;
 
   float *kick_hit = NULL;
   float *snare_hit = NULL;
@@ -629,9 +738,9 @@ int main(int argc, char **argv) {
   if (argc >= 2)
     wav_path = argv[1];
   if (argc >= 3)
-    kick_patch_arg = argv[2];
+    kick_patch_a_arg = argv[2];
   if (argc >= 4)
-    snare_patch_arg = argv[3];
+    snare_patch_a_arg = argv[3];
   if (argc >= 5)
     hh_patch_a_arg = argv[4];
   if (argc >= 6)
@@ -643,31 +752,49 @@ int main(int argc, char **argv) {
 
   po32_synth_init(&synth, DEMO_SAMPLE_RATE);
 
-  if (kick_patch_arg != NULL) {
-    if (!load_patch_from_mtdrum(kick_patch_arg, &kick)) {
-      fprintf(stderr, "failed to parse kick patch file: %s\n", kick_patch_arg);
+  if (kick_patch_a_arg != NULL) {
+    if (!load_patch_from_mtdrum(kick_patch_a_arg, &kick_a)) {
+      fprintf(stderr, "failed to parse kick patch A file: %s\n", kick_patch_a_arg);
       return 1;
     }
-  } else if (pick_random_kick_patch(random_kick_patch_path, sizeof(random_kick_patch_path)) &&
-             load_patch_from_mtdrum(random_kick_patch_path, &kick)) {
-    kick_patch_arg = random_kick_patch_path;
-    using_random_kick_patch = 1;
+  } else if (pick_random_kick_patch(random_kick_patch_a_path, sizeof(random_kick_patch_a_path)) &&
+             load_patch_from_mtdrum(random_kick_patch_a_path, &kick_a)) {
+    kick_patch_a_arg = random_kick_patch_a_path;
+    using_random_kick_patch_a = 1;
   } else {
-    make_kick_patch(&kick);
+    make_kick_patch(&kick_a);
   }
 
-  if (snare_patch_arg != NULL) {
-    if (!load_patch_from_mtdrum(snare_patch_arg, &snare)) {
-      fprintf(stderr, "failed to parse snare patch file: %s\n", snare_patch_arg);
+  if (pick_random_kick_patch_excluding(random_kick_patch_b_path, sizeof(random_kick_patch_b_path),
+                                       kick_patch_a_arg) &&
+      load_patch_from_mtdrum(random_kick_patch_b_path, &kick_b)) {
+    kick_patch_b_arg = random_kick_patch_b_path;
+    using_random_kick_patch_b = 1;
+  } else {
+    make_kick_patch_b(&kick_b);
+  }
+
+  if (snare_patch_a_arg != NULL) {
+    if (!load_patch_from_mtdrum(snare_patch_a_arg, &snare_a)) {
+      fprintf(stderr, "failed to parse snare patch A file: %s\n", snare_patch_a_arg);
       return 1;
     }
-  } else if (pick_random_snare_patch(random_snare_patch_path, sizeof(random_snare_patch_path),
-                                     kick_patch_arg) &&
-             load_patch_from_mtdrum(random_snare_patch_path, &snare)) {
-    snare_patch_arg = random_snare_patch_path;
-    using_random_snare_patch = 1;
+  } else if (pick_random_snare_patch(random_snare_patch_a_path, sizeof(random_snare_patch_a_path),
+                                     NULL) &&
+             load_patch_from_mtdrum(random_snare_patch_a_path, &snare_a)) {
+    snare_patch_a_arg = random_snare_patch_a_path;
+    using_random_snare_patch_a = 1;
   } else {
-    make_snare_patch(&snare);
+    make_snare_patch(&snare_a);
+  }
+
+  if (pick_random_snare_patch(random_snare_patch_b_path, sizeof(random_snare_patch_b_path),
+                              snare_patch_a_arg) &&
+      load_patch_from_mtdrum(random_snare_patch_b_path, &snare_b)) {
+    snare_patch_b_arg = random_snare_patch_b_path;
+    using_random_snare_patch_b = 1;
+  } else {
+    make_snare_patch_b(&snare_b);
   }
 
   if (hh_patch_a_arg != NULL) {
@@ -726,6 +853,12 @@ int main(int argc, char **argv) {
     make_any_patch_b(&any_b);
   }
 
+  generate_step_patterns(kick_steps, snare_steps, hihat_steps, fill_lengths, silence_steps);
+  for (size_t i = 0u; i < DEMO_BASE_STEPS; ++i) {
+    if (silence_steps[i] != 0u)
+      ++silence_count;
+  }
+
   hit_capacity = po32_synth_samples_for_duration(&synth, DEMO_HIT_SECONDS);
   hh_capacity = po32_synth_samples_for_duration(&synth, DEMO_HH_SECONDS);
   any_capacity = po32_synth_samples_for_duration(&synth, DEMO_ANY_SECONDS);
@@ -743,29 +876,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  status = po32_synth_render(&synth, &kick, DEMO_KICK_VELOCITY, DEMO_HIT_SECONDS, kick_hit,
-                             hit_capacity, &kick_len);
-  if (status != PO32_OK) {
-    fprintf(stderr, "failed to render kick hit: %d\n", status);
-    free(kick_hit);
-    free(snare_hit);
-    free(hh_hit);
-    free(any_hit);
-    return 1;
-  }
-
-  status = po32_synth_render(&synth, &snare, DEMO_SNARE_VELOCITY, DEMO_HIT_SECONDS, snare_hit,
-                             hit_capacity, &snare_len);
-  if (status != PO32_OK) {
-    fprintf(stderr, "failed to render snare hit: %d\n", status);
-    free(kick_hit);
-    free(snare_hit);
-    free(hh_hit);
-    free(any_hit);
-    return 1;
-  }
-
-  longest_hit_len = kick_len > snare_len ? kick_len : snare_len;
+  longest_hit_len = hit_capacity;
   if (hh_capacity > longest_hit_len)
     longest_hit_len = hh_capacity;
   if (any_capacity > longest_hit_len)
@@ -784,20 +895,52 @@ int main(int argc, char **argv) {
 
   for (size_t step = 0u; step < DEMO_TOTAL_STEPS; ++step) {
     uint8_t step64 = (uint8_t)(step % DEMO_BASE_STEPS);
+    uint8_t step16 = (uint8_t)(step64 % DEMO_SEQUENCE_STEPS);
     size_t start = step * step_samples;
 
-    if (is_kick_step(step64)) {
+    if (silence_steps[step64] != 0u)
+      continue;
+
+    if (kick_steps[step64] != 0u) {
+      float kick_morph = kick_morph_for_step(step);
+      interpolate_patch_params(&kick_a, &kick_b, kick_morph, &kick_step_patch);
+      status = po32_synth_render(&synth, &kick_step_patch, DEMO_KICK_VELOCITY, DEMO_HIT_SECONDS,
+                                 kick_hit, hit_capacity, &kick_len);
+      if (status != PO32_OK) {
+        fprintf(stderr, "failed to render kick hit on step %u: %d\n", (unsigned)(step + 1u),
+                status);
+        free(output);
+        free(kick_hit);
+        free(snare_hit);
+        free(hh_hit);
+        free(any_hit);
+        return 1;
+      }
       for (size_t i = 0u; i < kick_len && start + i < output_len; ++i)
         output[start + i] += kick_hit[i];
     }
 
-    if (is_snare_step(step64)) {
-      for (size_t i = 0u; i < snare_len && start + i < output_len; ++i)
+    if (snare_steps[step64] != 0u) {
+      float snare_morph = snare_morph_for_step(step);
+      interpolate_patch_params(&snare_a, &snare_b, snare_morph, &snare_step_patch);
+      status = po32_synth_render(&synth, &snare_step_patch, DEMO_SNARE_VELOCITY, DEMO_HIT_SECONDS,
+                                 snare_hit, hit_capacity, &snare_step_len);
+      if (status != PO32_OK) {
+        fprintf(stderr, "failed to render snare hit on step %u: %d\n", (unsigned)(step + 1u),
+                status);
+        free(output);
+        free(kick_hit);
+        free(snare_hit);
+        free(hh_hit);
+        free(any_hit);
+        return 1;
+      }
+      for (size_t i = 0u; i < snare_step_len && start + i < output_len; ++i)
         output[start + i] += snare_hit[i];
     }
 
-    if (is_hihat_step(step64)) {
-      float morph = hh_morph_for_step((uint8_t)(step64 % 32u));
+    if (hihat_steps[step64] != 0u) {
+      float morph = hh_morph_for_step(step64);
       interpolate_patch_params(&hh_a, &hh_b, morph, &hh_step_patch);
       status = po32_synth_render(&synth, &hh_step_patch, DEMO_HH_VELOCITY, DEMO_HH_SECONDS, hh_hit,
                                  hh_capacity, &hh_len);
@@ -815,8 +958,8 @@ int main(int argc, char **argv) {
         output[start + i] += hh_hit[i];
     }
 
-    if (is_any_step((uint8_t)(step64 % 16u))) {
-      float morph = any_morph_for_step((uint8_t)(step64 % 32u));
+    if (is_any_step(step16)) {
+      float morph = any_morph_for_step(step64);
       interpolate_patch_params(&any_a, &any_b, morph, &any_step_patch);
       status = po32_synth_render(&synth, &any_step_patch, DEMO_ANY_VELOCITY, DEMO_ANY_SECONDS,
                                  any_hit, any_capacity, &any_len);
@@ -859,27 +1002,56 @@ int main(int argc, char **argv) {
   }
 
   printf("wrote %s\n", wav_path);
-  printf("pattern: 64-step jungle pattern with 8-step end fill, repeated 2x (128 total steps) at "
-         "%.0f BPM\n",
+  printf("pattern: generated 4x16-step sequences repeated 2x (128 total steps) at %.0f BPM\n",
          DEMO_BPM);
-  printf("lanes: kick/snare/hihat jungle grid; steps 57-64 are dense kick+snare fill\n");
+  printf("fill chance: 25%% per 16-step sequence (last 8, 12, or 16 steps)\n");
+  for (uint8_t seq = 0u; seq < DEMO_SEQUENCE_COUNT; ++seq) {
+    if (fill_lengths[seq] == 0u) {
+      printf("  seq %u fill: none\n", (unsigned)(seq + 1u));
+    } else {
+      printf("  seq %u fill: last %u steps\n", (unsigned)(seq + 1u), (unsigned)fill_lengths[seq]);
+    }
+  }
+  printf("kick morph: Kick A -> Kick B -> Kick A over 3 beats (triangle), continuous across all "
+         "steps\n");
+  printf(
+      "snare morph: Snare A -> Snare B -> Snare A over 7 steps (triangle), continuous across all "
+      "steps\n");
   printf("hihat morph: HH A -> HH B over 4 steps, then back over 4 steps (oscillating)\n");
   printf("any morph: ANY A -> ANY B over 8 steps (repeats every 8 steps)\n");
+  printf("syncopation: %zu/%u base steps forced silent (10%% post-pass dropout)\n", silence_count,
+         DEMO_BASE_STEPS);
 
-  if (using_random_kick_patch) {
-    printf("kick patch: random from %s\n", kick_patch_arg);
-  } else if (kick_patch_arg != NULL) {
-    printf("kick patch: %s\n", kick_patch_arg);
+  if (using_random_kick_patch_a) {
+    printf("kick A patch: random from %s\n", kick_patch_a_arg);
+  } else if (kick_patch_a_arg != NULL) {
+    printf("kick A patch: %s\n", kick_patch_a_arg);
   } else {
-    printf("kick patch: built-in fallback\n");
+    printf("kick A patch: built-in fallback\n");
   }
 
-  if (using_random_snare_patch) {
-    printf("snare patch: random from %s\n", snare_patch_arg);
-  } else if (snare_patch_arg != NULL) {
-    printf("snare patch: %s\n", snare_patch_arg);
+  if (using_random_kick_patch_b) {
+    printf("kick B patch: random from %s\n", kick_patch_b_arg);
+  } else if (kick_patch_b_arg != NULL) {
+    printf("kick B patch: %s\n", kick_patch_b_arg);
   } else {
-    printf("snare patch: built-in fallback\n");
+    printf("kick B patch: built-in fallback\n");
+  }
+
+  if (using_random_snare_patch_a) {
+    printf("snare A patch: random from %s\n", snare_patch_a_arg);
+  } else if (snare_patch_a_arg != NULL) {
+    printf("snare A patch: %s\n", snare_patch_a_arg);
+  } else {
+    printf("snare A patch: built-in fallback\n");
+  }
+
+  if (using_random_snare_patch_b) {
+    printf("snare B patch: random from %s\n", snare_patch_b_arg);
+  } else if (snare_patch_b_arg != NULL) {
+    printf("snare B patch: %s\n", snare_patch_b_arg);
+  } else {
+    printf("snare B patch: built-in fallback\n");
   }
 
   if (using_random_hh_patch_a) {
