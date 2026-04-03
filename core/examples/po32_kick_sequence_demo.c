@@ -26,6 +26,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +34,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define DEMO_SAMPLE_RATE                     44100u
+#define DEMO_DEFAULT_SAMPLE_RATE             44100u
 #define DEMO_SEQUENCE_STEPS                  16u
 #define DEMO_DEFAULT_SEQUENCE_COUNT          8u
 #define DEMO_DEFAULT_BPM                     160.0f
@@ -56,10 +57,10 @@ static int write_wav(const char *path, const float *samples, size_t sample_count
     return 0;
 
   {
-    uint32_t data_bytes = (uint32_t)(sample_count * 2u);
+    uint32_t data_bytes = (uint32_t)(sample_count * 3u);
     uint32_t file_size = 36u + data_bytes;
     uint16_t channels = 1u;
-    uint16_t bits = 16u;
+    uint16_t bits = 24u;
     uint32_t byte_rate = sample_rate_hz * channels * (uint32_t)(bits / 8u);
     uint16_t block_align = (uint16_t)(channels * (bits / 8u));
     uint16_t pcm = 1u;
@@ -81,13 +82,19 @@ static int write_wav(const char *path, const float *samples, size_t sample_count
 
   for (size_t i = 0u; i < sample_count; ++i) {
     float sample = samples[i];
-    int16_t pcm_sample;
+    int32_t pcm_sample;
+    uint32_t packed;
+    uint8_t bytes[3];
     if (sample > 1.0f)
       sample = 1.0f;
     if (sample < -1.0f)
       sample = -1.0f;
-    pcm_sample = (int16_t)(sample * 32767.0f);
-    fwrite(&pcm_sample, 2u, 1u, fp);
+    pcm_sample = (int32_t)(sample * 8388607.0f);
+    packed = (uint32_t)pcm_sample & 0x00FFFFFFu;
+    bytes[0] = (uint8_t)(packed & 0xFFu);
+    bytes[1] = (uint8_t)((packed >> 8u) & 0xFFu);
+    bytes[2] = (uint8_t)((packed >> 16u) & 0xFFu);
+    fwrite(bytes, 1u, sizeof(bytes), fp);
   }
 
   fclose(fp);
@@ -109,6 +116,19 @@ static int chance_probability(float probability) {
   if (probability >= 1.0f)
     return 1;
   return ((float)rand() / ((float)RAND_MAX + 1.0f)) < probability;
+}
+
+static int parse_float_value(const char *text, float *out_value) {
+  char *endptr = NULL;
+  float parsed = strtof(text, &endptr);
+  if (endptr == text || *endptr != '\0' || !isfinite(parsed))
+    return 0;
+  *out_value = parsed;
+  return 1;
+}
+
+static float db_to_gain(float db) {
+  return powf(10.0f, db / 20.0f);
 }
 
 static uint8_t random_fill_length(void) {
@@ -642,16 +662,20 @@ static float lerp01(float a, float b, float t) {
 
 static void print_usage(const char *program_name) {
   fprintf(stderr,
-          "usage: %s [--bpm 160] [--num 8] [--fill 0.25] [--syncopation 0.1] [output.wav] "
-          "[kick_patch.mtdrum] [snare_patch.mtdrum] "
-          "[hh_a.mtdrum] [hh_b.mtdrum] [any_a.mtdrum] [any_b.mtdrum]\n",
+          "usage: %s [--sample-rate 96000] [--bpm 160] [--num 8] [--fill 0.25] "
+          "[--syncopation 0.1] [--kick -3] [--snare -2] [--hihat -6] [--any -4] [output.wav] "
+          "[kick_patch.mtdrum] [snare_patch.mtdrum] [hh_a.mtdrum] [hh_b.mtdrum] "
+          "[any_a.mtdrum] [any_b.mtdrum]\n",
           program_name);
+  fprintf(stderr, "  --sample-rate/--sr must be 8000..384000 (default %u)\n",
+          (unsigned)DEMO_DEFAULT_SAMPLE_RATE);
   fprintf(stderr, "  --bpm must be > 0 (default %.1f)\n", (double)DEMO_DEFAULT_BPM);
   fprintf(stderr, "  --num must be >= 1 (default %u)\n", (unsigned)DEMO_DEFAULT_SEQUENCE_COUNT);
   fprintf(stderr, "  --fill must be between 0.0 and 1.0 (default %.2f)\n",
           (double)DEMO_DEFAULT_FILL_PROBABILITY);
   fprintf(stderr, "  --syncopation must be between 0.0 and 1.0 (default %.2f)\n",
           (double)DEMO_DEFAULT_SYNCOPATION_PROBABILITY);
+  fprintf(stderr, "  --kick/--snare/--hihat/--any are dB trims (default 0.0 dB)\n");
 }
 
 static void interpolate_patch_params(const po32_patch_params_t *a, const po32_patch_params_t *b,
@@ -693,10 +717,19 @@ int main(int argc, char **argv) {
   const char *any_patch_b_arg = NULL;
   const char *positionals[7] = {0};
   size_t positional_count = 0u;
+  uint32_t sample_rate_hz = DEMO_DEFAULT_SAMPLE_RATE;
   float bpm = DEMO_DEFAULT_BPM;
   size_t sequence_count = DEMO_DEFAULT_SEQUENCE_COUNT;
   float fill_probability = DEMO_DEFAULT_FILL_PROBABILITY;
   float syncopation_probability = DEMO_DEFAULT_SYNCOPATION_PROBABILITY;
+  float kick_db = 0.0f;
+  float snare_db = 0.0f;
+  float hihat_db = 0.0f;
+  float any_db = 0.0f;
+  float kick_gain = 1.0f;
+  float snare_gain = 1.0f;
+  float hihat_gain = 1.0f;
+  float any_gain = 1.0f;
   size_t base_steps = 0u;
   size_t total_steps = 0u;
 
@@ -768,6 +801,100 @@ int main(int argc, char **argv) {
     if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
       print_usage(argv[0]);
       return 0;
+    }
+
+    if (strcmp(arg, "--sample-rate") == 0 || strcmp(arg, "--sr") == 0) {
+      unsigned long parsed = 0ul;
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "missing value for %s\n", arg);
+        print_usage(argv[0]);
+        return 1;
+      }
+      parsed = strtoul(argv[++argi], &endptr, 10);
+      if (endptr == argv[argi] || *endptr != '\0' || parsed < 8000ul || parsed > 384000ul) {
+        fprintf(stderr, "invalid sample-rate value: %s\n", argv[argi]);
+        print_usage(argv[0]);
+        return 1;
+      }
+      sample_rate_hz = (uint32_t)parsed;
+      continue;
+    }
+
+    if (strncmp(arg, "--sample-rate=", 14u) == 0) {
+      const char *value = arg + 14;
+      unsigned long parsed = strtoul(value, &endptr, 10);
+      if (endptr == value || *endptr != '\0' || parsed < 8000ul || parsed > 384000ul) {
+        fprintf(stderr, "invalid sample-rate value: %s\n", value);
+        print_usage(argv[0]);
+        return 1;
+      }
+      sample_rate_hz = (uint32_t)parsed;
+      continue;
+    }
+
+    if (strncmp(arg, "--sr=", 5u) == 0) {
+      const char *value = arg + 5;
+      unsigned long parsed = strtoul(value, &endptr, 10);
+      if (endptr == value || *endptr != '\0' || parsed < 8000ul || parsed > 384000ul) {
+        fprintf(stderr, "invalid sample-rate value: %s\n", value);
+        print_usage(argv[0]);
+        return 1;
+      }
+      sample_rate_hz = (uint32_t)parsed;
+      continue;
+    }
+
+    if (strcmp(arg, "--kick") == 0 || strcmp(arg, "--snare") == 0 || strcmp(arg, "--hihat") == 0 ||
+        strcmp(arg, "--any") == 0) {
+      float parsed = 0.0f;
+      float *target_db = NULL;
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "missing value for %s\n", arg);
+        print_usage(argv[0]);
+        return 1;
+      }
+      if (strcmp(arg, "--kick") == 0)
+        target_db = &kick_db;
+      else if (strcmp(arg, "--snare") == 0)
+        target_db = &snare_db;
+      else if (strcmp(arg, "--hihat") == 0)
+        target_db = &hihat_db;
+      else
+        target_db = &any_db;
+      if (!parse_float_value(argv[++argi], &parsed)) {
+        fprintf(stderr, "invalid %s value: %s\n", arg, argv[argi]);
+        print_usage(argv[0]);
+        return 1;
+      }
+      *target_db = parsed;
+      continue;
+    }
+
+    if (strncmp(arg, "--kick=", 7u) == 0 || strncmp(arg, "--snare=", 8u) == 0 ||
+        strncmp(arg, "--hihat=", 8u) == 0 || strncmp(arg, "--any=", 6u) == 0) {
+      const char *value = NULL;
+      float parsed = 0.0f;
+      float *target_db = NULL;
+      if (strncmp(arg, "--kick=", 7u) == 0) {
+        value = arg + 7;
+        target_db = &kick_db;
+      } else if (strncmp(arg, "--snare=", 8u) == 0) {
+        value = arg + 8;
+        target_db = &snare_db;
+      } else if (strncmp(arg, "--hihat=", 8u) == 0) {
+        value = arg + 8;
+        target_db = &hihat_db;
+      } else {
+        value = arg + 6;
+        target_db = &any_db;
+      }
+      if (!parse_float_value(value, &parsed)) {
+        fprintf(stderr, "invalid dB option value: %s\n", value);
+        print_usage(argv[0]);
+        return 1;
+      }
+      *target_db = parsed;
+      continue;
     }
 
     if (strcmp(arg, "--bpm") == 0) {
@@ -924,7 +1051,7 @@ int main(int argc, char **argv) {
   base_steps = sequence_count * DEMO_SEQUENCE_STEPS;
   total_steps = base_steps;
   step_seconds = (60.0f / bpm) / 4.0f;
-  step_samples = (size_t)(step_seconds * (float)DEMO_SAMPLE_RATE + 0.5f);
+  step_samples = (size_t)(step_seconds * (float)sample_rate_hz + 0.5f);
   if (step_samples == 0u)
     step_samples = 1u;
   if (total_steps != 0u && step_samples > SIZE_MAX / total_steps) {
@@ -933,7 +1060,17 @@ int main(int argc, char **argv) {
   }
   total_samples = step_samples * total_steps;
 
-  po32_synth_init(&synth, DEMO_SAMPLE_RATE);
+  kick_gain = db_to_gain(kick_db);
+  snare_gain = db_to_gain(snare_db);
+  hihat_gain = db_to_gain(hihat_db);
+  any_gain = db_to_gain(any_db);
+  if (!isfinite(kick_gain) || !isfinite(snare_gain) || !isfinite(hihat_gain) ||
+      !isfinite(any_gain)) {
+    fputs("one or more dB trims produced invalid gain values\n", stderr);
+    return 1;
+  }
+
+  po32_synth_init(&synth, sample_rate_hz);
 
   if (kick_patch_a_arg != NULL) {
     if (!load_patch_from_mtdrum(kick_patch_a_arg, &kick_a)) {
@@ -1132,7 +1269,7 @@ int main(int argc, char **argv) {
         return 1;
       }
       for (size_t i = 0u; i < kick_len && start + i < output_len; ++i)
-        output[start + i] += kick_hit[i];
+        output[start + i] += kick_hit[i] * kick_gain;
     }
 
     if (snare_steps[step_index] != 0u) {
@@ -1156,7 +1293,7 @@ int main(int argc, char **argv) {
         return 1;
       }
       for (size_t i = 0u; i < snare_step_len && start + i < output_len; ++i)
-        output[start + i] += snare_hit[i];
+        output[start + i] += snare_hit[i] * snare_gain;
     }
 
     if (hihat_steps[step_index] != 0u) {
@@ -1180,7 +1317,7 @@ int main(int argc, char **argv) {
         return 1;
       }
       for (size_t i = 0u; i < hh_len && start + i < output_len; ++i)
-        output[start + i] += hh_hit[i];
+        output[start + i] += hh_hit[i] * hihat_gain;
     }
 
     if (is_any_step(step16)) {
@@ -1204,7 +1341,7 @@ int main(int argc, char **argv) {
         return 1;
       }
       for (size_t i = 0u; i < any_len && start + i < output_len; ++i)
-        output[start + i] += any_hit[i];
+        output[start + i] += any_hit[i] * any_gain;
     }
   }
 
@@ -1221,7 +1358,7 @@ int main(int argc, char **argv) {
       output[i] *= gain;
   }
 
-  if (!write_wav(wav_path, output, output_len, DEMO_SAMPLE_RATE)) {
+  if (!write_wav(wav_path, output, output_len, sample_rate_hz)) {
     fprintf(stderr, "failed to write wav file: %s\n", wav_path);
     free(output);
     free(kick_hit);
@@ -1237,6 +1374,7 @@ int main(int argc, char **argv) {
   }
 
   printf("wrote %s\n", wav_path);
+  printf("sample rate: %u Hz\n", (unsigned)sample_rate_hz);
   printf("pattern: generated %ux16-step sequences (%u total steps) at %.0f BPM\n",
          (unsigned)sequence_count, (unsigned)total_steps, bpm);
   printf("fill chance: %.1f%% per 16-step sequence (last 8, 12, or 16 steps)\n",
@@ -1257,6 +1395,8 @@ int main(int argc, char **argv) {
   printf("any morph: ANY A -> ANY B over 8 steps (repeats every 8 steps)\n");
   printf("syncopation: %zu/%u base steps forced silent (configured %.1f%% dropout)\n",
          silence_count, (unsigned)base_steps, (double)(syncopation_probability * 100.0f));
+  printf("mix trim: kick %.1f dB, snare %.1f dB, hihat %.1f dB, any %.1f dB\n", (double)kick_db,
+         (double)snare_db, (double)hihat_db, (double)any_db);
 
   if (using_random_kick_patch_a) {
     printf("kick A patch: random from %s\n", kick_patch_a_arg);
@@ -1322,8 +1462,8 @@ int main(int argc, char **argv) {
     printf("any B patch: built-in fallback\n");
   }
 
-  printf("duration: %.3f s (%zu samples @ %u Hz)\n", (double)output_len / (double)DEMO_SAMPLE_RATE,
-         output_len, DEMO_SAMPLE_RATE);
+  printf("duration: %.3f s (%zu samples @ %u Hz)\n", (double)output_len / (double)sample_rate_hz,
+         output_len, (unsigned)sample_rate_hz);
 
   free(output);
   free(kick_hit);
