@@ -32,21 +32,21 @@
 #include <time.h>
 #include <unistd.h>
 
-#define DEMO_SAMPLE_RATE    44100u
-#define DEMO_SEQUENCE_STEPS 16u
-#define DEMO_SEQUENCE_COUNT 4u
-#define DEMO_BASE_STEPS     (DEMO_SEQUENCE_STEPS * DEMO_SEQUENCE_COUNT)
-#define DEMO_TOTAL_STEPS    (DEMO_BASE_STEPS * 2u)
-#define DEMO_BPM            160.0f
-#define DEMO_KICK_VELOCITY  120
-#define DEMO_SNARE_VELOCITY 118
-#define DEMO_HH_VELOCITY    110
-#define DEMO_ANY_VELOCITY   114
-#define DEMO_HIT_SECONDS    0.50f
-#define DEMO_HH_SECONDS     0.25f
-#define DEMO_ANY_SECONDS    0.40f
-#define DEMO_PATCH_DIR      "/Library/Audio/Presets/Sonic Charge/Microtonic Drum Patches/All"
-#define DEMO_PATH_MAX       4096u
+#define DEMO_SAMPLE_RATE                    44100u
+#define DEMO_SEQUENCE_STEPS                 16u
+#define DEMO_DEFAULT_SEQUENCE_COUNT         8u
+#define DEMO_DEFAULT_BPM                    160.0f
+#define DEMO_DEFAULT_SYNCOPATION_PROBABILITY 0.10f
+#define DEMO_DEFAULT_FILL_PROBABILITY       0.25f
+#define DEMO_KICK_VELOCITY                  120
+#define DEMO_SNARE_VELOCITY                 118
+#define DEMO_HH_VELOCITY                    110
+#define DEMO_ANY_VELOCITY                   114
+#define DEMO_HIT_SECONDS                    0.50f
+#define DEMO_HH_SECONDS                     0.25f
+#define DEMO_ANY_SECONDS                    0.40f
+#define DEMO_PATCH_DIR                      "/Library/Audio/Presets/Sonic Charge/Microtonic Drum Patches/All"
+#define DEMO_PATH_MAX                       4096u
 
 static int write_wav(const char *path, const float *samples, size_t sample_count,
                      uint32_t sample_rate_hz) {
@@ -102,6 +102,14 @@ static int chance_percent(int percent) {
   return (rand() % 100) < percent;
 }
 
+static int chance_probability(float probability) {
+  if (probability <= 0.0f)
+    return 0;
+  if (probability >= 1.0f)
+    return 1;
+  return ((float)rand() / ((float)RAND_MAX + 1.0f)) < probability;
+}
+
 static uint8_t random_fill_length(void) {
   switch (rand() % 3) {
   case 0:
@@ -114,13 +122,15 @@ static uint8_t random_fill_length(void) {
 }
 
 static void generate_step_patterns(uint8_t *kick_steps, uint8_t *snare_steps, uint8_t *hihat_steps,
-                                   uint8_t *fill_lengths, uint8_t *silence_steps) {
-  memset(kick_steps, 0, DEMO_BASE_STEPS);
-  memset(snare_steps, 0, DEMO_BASE_STEPS);
-  memset(hihat_steps, 0, DEMO_BASE_STEPS);
-  memset(silence_steps, 0, DEMO_BASE_STEPS);
+                                   uint8_t *fill_lengths, uint8_t *silence_steps,
+                                   size_t sequence_count, size_t base_steps, float fill_probability,
+                                   float syncopation_probability) {
+  memset(kick_steps, 0, base_steps);
+  memset(snare_steps, 0, base_steps);
+  memset(hihat_steps, 0, base_steps);
+  memset(silence_steps, 0, base_steps);
 
-  for (uint8_t seq = 0u; seq < DEMO_SEQUENCE_COUNT; ++seq) {
+  for (size_t seq = 0u; seq < sequence_count; ++seq) {
     size_t base = (size_t)seq * DEMO_SEQUENCE_STEPS;
     uint8_t fill_len = 0u;
 
@@ -148,8 +158,8 @@ static void generate_step_patterns(uint8_t *kick_steps, uint8_t *snare_steps, ui
         hihat_steps[base + s] = 1u;
     }
 
-    /* 25% chance this 16-step block ends in a fill. */
-    if (chance_percent(25)) {
+    /* Configurable chance this 16-step block ends in a fill. */
+    if (chance_probability(fill_probability)) {
       fill_len = random_fill_length();
       for (uint8_t s = (uint8_t)(DEMO_SEQUENCE_STEPS - fill_len); s < DEMO_SEQUENCE_STEPS; ++s) {
         size_t idx = base + s;
@@ -175,9 +185,9 @@ static void generate_step_patterns(uint8_t *kick_steps, uint8_t *snare_steps, ui
     fill_lengths[seq] = fill_len;
   }
 
-  /* Post-pass syncopation: force true silent steps with 10% probability. */
-  for (size_t i = 0u; i < DEMO_BASE_STEPS; ++i) {
-    if (!chance_percent(10))
+  /* Post-pass syncopation: force true silent steps with configured probability. */
+  for (size_t i = 0u; i < base_steps; ++i) {
+    if (!chance_probability(syncopation_probability))
       continue;
     silence_steps[i] = 1u;
     kick_steps[i] = 0u;
@@ -186,7 +196,7 @@ static void generate_step_patterns(uint8_t *kick_steps, uint8_t *snare_steps, ui
   }
 
   /* Keep each 16-step phrase minimally populated. */
-  for (uint8_t seq = 0u; seq < DEMO_SEQUENCE_COUNT; ++seq) {
+  for (size_t seq = 0u; seq < sequence_count; ++seq) {
     size_t base = (size_t)seq * DEMO_SEQUENCE_STEPS;
     int has_kick = 0;
     int has_snare = 0;
@@ -595,7 +605,7 @@ static int load_patch_from_mtdrum(const char *path, po32_patch_params_t *out_par
   return status == PO32_OK;
 }
 
-static float hh_morph_for_step(uint8_t step_index) {
+static float hh_morph_for_step(size_t step_index) {
   uint8_t phase = (uint8_t)(step_index % 8u);
   if (phase <= 4u)
     return (float)phase / 4.0f;
@@ -620,13 +630,26 @@ static float snare_morph_for_step(size_t step_index) {
   return (float)(period_steps - phase) / (float)half_period;
 }
 
-static float any_morph_for_step(uint8_t step_index) {
+static float any_morph_for_step(size_t step_index) {
   uint8_t phase = (uint8_t)(step_index % 8u);
   return (float)phase / 7.0f;
 }
 
 static float lerp01(float a, float b, float t) {
   return a + (b - a) * t;
+}
+
+static void print_usage(const char *program_name) {
+  fprintf(stderr,
+          "usage: %s [--bpm 160] [--num 8] [--fill 0.25] [--syncopation 0.1] [output.wav] "
+          "[kick_patch.mtdrum] [snare_patch.mtdrum] "
+          "[hh_a.mtdrum] [hh_b.mtdrum] [any_a.mtdrum] [any_b.mtdrum]\n",
+          program_name);
+  fprintf(stderr, "  --bpm must be > 0 (default %.1f)\n", (double)DEMO_DEFAULT_BPM);
+  fprintf(stderr, "  --num must be >= 1 (default %u)\n", (unsigned)DEMO_DEFAULT_SEQUENCE_COUNT);
+  fprintf(stderr, "  --fill must be between 0.0 and 1.0 (default %.2f)\n",
+          (double)DEMO_DEFAULT_FILL_PROBABILITY);
+  fprintf(stderr, "  --syncopation must be between 0.0 and 1.0 (default 0.1)\n");
 }
 
 static void interpolate_patch_params(const po32_patch_params_t *a, const po32_patch_params_t *b,
@@ -666,6 +689,14 @@ int main(int argc, char **argv) {
   const char *hh_patch_b_arg = NULL;
   const char *any_patch_a_arg = NULL;
   const char *any_patch_b_arg = NULL;
+  const char *positionals[7] = {0};
+  size_t positional_count = 0u;
+  float bpm = DEMO_DEFAULT_BPM;
+  size_t sequence_count = DEMO_DEFAULT_SEQUENCE_COUNT;
+  float fill_probability = DEMO_DEFAULT_FILL_PROBABILITY;
+  float syncopation_probability = DEMO_DEFAULT_SYNCOPATION_PROBABILITY;
+  size_t base_steps = 0u;
+  size_t total_steps = 0u;
 
   char random_kick_patch_a_path[DEMO_PATH_MAX];
   char random_kick_patch_b_path[DEMO_PATH_MAX];
@@ -700,9 +731,9 @@ int main(int argc, char **argv) {
   po32_patch_params_t any_step_patch;
   po32_status_t status;
 
-  float step_seconds = (60.0f / DEMO_BPM) / 4.0f;
-  size_t step_samples = (size_t)(step_seconds * (float)DEMO_SAMPLE_RATE + 0.5f);
-  size_t total_samples = step_samples * DEMO_TOTAL_STEPS;
+  float step_seconds;
+  size_t step_samples;
+  size_t total_samples;
   size_t hit_capacity;
   size_t hh_capacity;
   size_t any_capacity;
@@ -712,11 +743,11 @@ int main(int argc, char **argv) {
   size_t any_len = 0u;
   size_t longest_hit_len;
   size_t output_len;
-  uint8_t kick_steps[DEMO_BASE_STEPS];
-  uint8_t snare_steps[DEMO_BASE_STEPS];
-  uint8_t hihat_steps[DEMO_BASE_STEPS];
-  uint8_t silence_steps[DEMO_BASE_STEPS];
-  uint8_t fill_lengths[DEMO_SEQUENCE_COUNT];
+  uint8_t *kick_steps = NULL;
+  uint8_t *snare_steps = NULL;
+  uint8_t *hihat_steps = NULL;
+  uint8_t *silence_steps = NULL;
+  uint8_t *fill_lengths = NULL;
   size_t silence_count = 0u;
 
   float *kick_hit = NULL;
@@ -728,27 +759,177 @@ int main(int argc, char **argv) {
 
   srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
 
-  if (argc > 8) {
-    fprintf(stderr,
-            "usage: %s [output.wav] [kick_patch.mtdrum] [snare_patch.mtdrum] [hh_a.mtdrum] "
-            "[hh_b.mtdrum] [any_a.mtdrum] [any_b.mtdrum]\n",
-            argv[0]);
+  for (int argi = 1; argi < argc; ++argi) {
+    const char *arg = argv[argi];
+    char *endptr = NULL;
+
+    if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+      print_usage(argv[0]);
+      return 0;
+    }
+
+    if (strcmp(arg, "--bpm") == 0) {
+      float parsed = 0.0f;
+      if (argi + 1 >= argc) {
+        fputs("missing value for --bpm\n", stderr);
+        print_usage(argv[0]);
+        return 1;
+      }
+      parsed = strtof(argv[++argi], &endptr);
+      if (endptr == argv[argi] || *endptr != '\0' || parsed <= 0.0f) {
+        fprintf(stderr, "invalid --bpm value: %s\n", argv[argi]);
+        print_usage(argv[0]);
+        return 1;
+      }
+      bpm = parsed;
+      continue;
+    }
+
+    if (strncmp(arg, "--bpm=", 6u) == 0) {
+      const char *value = arg + 6;
+      float parsed = strtof(value, &endptr);
+      if (endptr == value || *endptr != '\0' || parsed <= 0.0f) {
+        fprintf(stderr, "invalid --bpm value: %s\n", value);
+        print_usage(argv[0]);
+        return 1;
+      }
+      bpm = parsed;
+      continue;
+    }
+
+    if (strcmp(arg, "--num") == 0) {
+      unsigned long parsed = 0ul;
+      if (argi + 1 >= argc) {
+        fputs("missing value for --num\n", stderr);
+        print_usage(argv[0]);
+        return 1;
+      }
+      parsed = strtoul(argv[++argi], &endptr, 10);
+      if (endptr == argv[argi] || *endptr != '\0' || parsed == 0ul ||
+          parsed > (unsigned long)(SIZE_MAX / DEMO_SEQUENCE_STEPS)) {
+        fprintf(stderr, "invalid --num value: %s\n", argv[argi]);
+        print_usage(argv[0]);
+        return 1;
+      }
+      sequence_count = (size_t)parsed;
+      continue;
+    }
+
+    if (strncmp(arg, "--num=", 6u) == 0) {
+      const char *value = arg + 6;
+      unsigned long parsed = strtoul(value, &endptr, 10);
+      if (endptr == value || *endptr != '\0' || parsed == 0ul ||
+          parsed > (unsigned long)(SIZE_MAX / DEMO_SEQUENCE_STEPS)) {
+        fprintf(stderr, "invalid --num value: %s\n", value);
+        print_usage(argv[0]);
+        return 1;
+      }
+      sequence_count = (size_t)parsed;
+      continue;
+    }
+
+    if (strcmp(arg, "--fill") == 0 || strcmp(arg, "--fill-prob") == 0) {
+      float parsed = 0.0f;
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "missing value for %s\n", arg);
+        print_usage(argv[0]);
+        return 1;
+      }
+      parsed = strtof(argv[++argi], &endptr);
+      if (endptr == argv[argi] || *endptr != '\0' || parsed < 0.0f || parsed > 1.0f) {
+        fprintf(stderr, "invalid --fill value: %s\n", argv[argi]);
+        print_usage(argv[0]);
+        return 1;
+      }
+      fill_probability = parsed;
+      continue;
+    }
+
+    if (strncmp(arg, "--fill=", 7u) == 0 || strncmp(arg, "--fill-prob=", 12u) == 0) {
+      const char *value = (arg[6] == '=') ? (arg + 7) : (arg + 12);
+      float parsed = strtof(value, &endptr);
+      if (endptr == value || *endptr != '\0' || parsed < 0.0f || parsed > 1.0f) {
+        fprintf(stderr, "invalid --fill value: %s\n", value);
+        print_usage(argv[0]);
+        return 1;
+      }
+      fill_probability = parsed;
+      continue;
+    }
+
+    if (strcmp(arg, "--syncopation") == 0) {
+      float parsed = 0.0f;
+      if (argi + 1 >= argc) {
+        fputs("missing value for --syncopation\n", stderr);
+        print_usage(argv[0]);
+        return 1;
+      }
+      parsed = strtof(argv[++argi], &endptr);
+      if (endptr == argv[argi] || *endptr != '\0' || parsed < 0.0f || parsed > 1.0f) {
+        fprintf(stderr, "invalid --syncopation value: %s\n", argv[argi]);
+        print_usage(argv[0]);
+        return 1;
+      }
+      syncopation_probability = parsed;
+      continue;
+    }
+
+    if (strncmp(arg, "--syncopation=", 14u) == 0) {
+      const char *value = arg + 14;
+      float parsed = strtof(value, &endptr);
+      if (endptr == value || *endptr != '\0' || parsed < 0.0f || parsed > 1.0f) {
+        fprintf(stderr, "invalid --syncopation value: %s\n", value);
+        print_usage(argv[0]);
+        return 1;
+      }
+      syncopation_probability = parsed;
+      continue;
+    }
+
+    if (arg[0] == '-' && arg[1] != '\0') {
+      fprintf(stderr, "unknown option: %s\n", arg);
+      print_usage(argv[0]);
+      return 1;
+    }
+
+    if (positional_count >= 7u) {
+      fputs("too many positional arguments\n", stderr);
+      print_usage(argv[0]);
+      return 1;
+    }
+    positionals[positional_count++] = arg;
+  }
+
+  if (positional_count >= 1u)
+    wav_path = positionals[0];
+  if (positional_count >= 2u)
+    kick_patch_a_arg = positionals[1];
+  if (positional_count >= 3u)
+    snare_patch_a_arg = positionals[2];
+  if (positional_count >= 4u)
+    hh_patch_a_arg = positionals[3];
+  if (positional_count >= 5u)
+    hh_patch_b_arg = positionals[4];
+  if (positional_count >= 6u)
+    any_patch_a_arg = positionals[5];
+  if (positional_count >= 7u)
+    any_patch_b_arg = positionals[6];
+
+  if (sequence_count > SIZE_MAX / DEMO_SEQUENCE_STEPS) {
+    fputs("--num is too large\n", stderr);
     return 1;
   }
-  if (argc >= 2)
-    wav_path = argv[1];
-  if (argc >= 3)
-    kick_patch_a_arg = argv[2];
-  if (argc >= 4)
-    snare_patch_a_arg = argv[3];
-  if (argc >= 5)
-    hh_patch_a_arg = argv[4];
-  if (argc >= 6)
-    hh_patch_b_arg = argv[5];
-  if (argc >= 7)
-    any_patch_a_arg = argv[6];
-  if (argc >= 8)
-    any_patch_b_arg = argv[7];
+  base_steps = sequence_count * DEMO_SEQUENCE_STEPS;
+  total_steps = base_steps;
+  step_seconds = (60.0f / bpm) / 4.0f;
+  step_samples = (size_t)(step_seconds * (float)DEMO_SAMPLE_RATE + 0.5f);
+  if (step_samples == 0u)
+    step_samples = 1u;
+  if (total_steps != 0u && step_samples > SIZE_MAX / total_steps) {
+    fputs("requested pattern is too large\n", stderr);
+    return 1;
+  }
+  total_samples = step_samples * total_steps;
 
   po32_synth_init(&synth, DEMO_SAMPLE_RATE);
 
@@ -853,8 +1034,25 @@ int main(int argc, char **argv) {
     make_any_patch_b(&any_b);
   }
 
-  generate_step_patterns(kick_steps, snare_steps, hihat_steps, fill_lengths, silence_steps);
-  for (size_t i = 0u; i < DEMO_BASE_STEPS; ++i) {
+  kick_steps = (uint8_t *)malloc(base_steps * sizeof(*kick_steps));
+  snare_steps = (uint8_t *)malloc(base_steps * sizeof(*snare_steps));
+  hihat_steps = (uint8_t *)malloc(base_steps * sizeof(*hihat_steps));
+  silence_steps = (uint8_t *)malloc(base_steps * sizeof(*silence_steps));
+  fill_lengths = (uint8_t *)malloc(sequence_count * sizeof(*fill_lengths));
+  if (kick_steps == NULL || snare_steps == NULL || hihat_steps == NULL || silence_steps == NULL ||
+      fill_lengths == NULL) {
+    fputs("failed to allocate step buffers\n", stderr);
+    free(kick_steps);
+    free(snare_steps);
+    free(hihat_steps);
+    free(silence_steps);
+    free(fill_lengths);
+    return 1;
+  }
+
+  generate_step_patterns(kick_steps, snare_steps, hihat_steps, fill_lengths, silence_steps,
+                         sequence_count, base_steps, fill_probability, syncopation_probability);
+  for (size_t i = 0u; i < base_steps; ++i) {
     if (silence_steps[i] != 0u)
       ++silence_count;
   }
@@ -893,15 +1091,15 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  for (size_t step = 0u; step < DEMO_TOTAL_STEPS; ++step) {
-    uint8_t step64 = (uint8_t)(step % DEMO_BASE_STEPS);
-    uint8_t step16 = (uint8_t)(step64 % DEMO_SEQUENCE_STEPS);
+  for (size_t step = 0u; step < total_steps; ++step) {
+    size_t step_index = step % base_steps;
+    uint8_t step16 = (uint8_t)(step_index % DEMO_SEQUENCE_STEPS);
     size_t start = step * step_samples;
 
-    if (silence_steps[step64] != 0u)
+    if (silence_steps[step_index] != 0u)
       continue;
 
-    if (kick_steps[step64] != 0u) {
+    if (kick_steps[step_index] != 0u) {
       float kick_morph = kick_morph_for_step(step);
       interpolate_patch_params(&kick_a, &kick_b, kick_morph, &kick_step_patch);
       status = po32_synth_render(&synth, &kick_step_patch, DEMO_KICK_VELOCITY, DEMO_HIT_SECONDS,
@@ -920,7 +1118,7 @@ int main(int argc, char **argv) {
         output[start + i] += kick_hit[i];
     }
 
-    if (snare_steps[step64] != 0u) {
+    if (snare_steps[step_index] != 0u) {
       float snare_morph = snare_morph_for_step(step);
       interpolate_patch_params(&snare_a, &snare_b, snare_morph, &snare_step_patch);
       status = po32_synth_render(&synth, &snare_step_patch, DEMO_SNARE_VELOCITY, DEMO_HIT_SECONDS,
@@ -939,8 +1137,8 @@ int main(int argc, char **argv) {
         output[start + i] += snare_hit[i];
     }
 
-    if (hihat_steps[step64] != 0u) {
-      float morph = hh_morph_for_step(step64);
+    if (hihat_steps[step_index] != 0u) {
+      float morph = hh_morph_for_step(step_index);
       interpolate_patch_params(&hh_a, &hh_b, morph, &hh_step_patch);
       status = po32_synth_render(&synth, &hh_step_patch, DEMO_HH_VELOCITY, DEMO_HH_SECONDS, hh_hit,
                                  hh_capacity, &hh_len);
@@ -959,7 +1157,7 @@ int main(int argc, char **argv) {
     }
 
     if (is_any_step(step16)) {
-      float morph = any_morph_for_step(step64);
+      float morph = any_morph_for_step(step_index);
       interpolate_patch_params(&any_a, &any_b, morph, &any_step_patch);
       status = po32_synth_render(&synth, &any_step_patch, DEMO_ANY_VELOCITY, DEMO_ANY_SECONDS,
                                  any_hit, any_capacity, &any_len);
@@ -1002,8 +1200,8 @@ int main(int argc, char **argv) {
   }
 
   printf("wrote %s\n", wav_path);
-  printf("pattern: generated 4x16-step sequences repeated 2x (128 total steps) at %.0f BPM\n",
-         DEMO_BPM);
+  printf("pattern: generated %ux16-step sequences (%u total steps) at %.0f BPM\n",
+         (unsigned)DEMO_SEQUENCE_COUNT, (unsigned)DEMO_TOTAL_STEPS, DEMO_BPM);
   printf("fill chance: 25%% per 16-step sequence (last 8, 12, or 16 steps)\n");
   for (uint8_t seq = 0u; seq < DEMO_SEQUENCE_COUNT; ++seq) {
     if (fill_lengths[seq] == 0u) {
@@ -1019,8 +1217,8 @@ int main(int argc, char **argv) {
       "steps\n");
   printf("hihat morph: HH A -> HH B over 4 steps, then back over 4 steps (oscillating)\n");
   printf("any morph: ANY A -> ANY B over 8 steps (repeats every 8 steps)\n");
-  printf("syncopation: %zu/%u base steps forced silent (10%% post-pass dropout)\n", silence_count,
-         DEMO_BASE_STEPS);
+  printf("syncopation: %zu/%u base steps forced silent (configured %.1f%% dropout)\n",
+         silence_count, DEMO_BASE_STEPS, (double)(syncopation_probability * 100.0f));
 
   if (using_random_kick_patch_a) {
     printf("kick A patch: random from %s\n", kick_patch_a_arg);
