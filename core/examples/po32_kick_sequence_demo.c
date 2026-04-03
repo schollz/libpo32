@@ -40,6 +40,7 @@
 #define DEMO_DEFAULT_BPM                     160.0f
 #define DEMO_DEFAULT_SYNCOPATION_PROBABILITY 0.10f
 #define DEMO_DEFAULT_FILL_PROBABILITY        0.25f
+#define DEMO_DEFAULT_SWAP_PROBABILITY        0.0f
 #define DEMO_KICK_VELOCITY                   120
 #define DEMO_SNARE_VELOCITY                  118
 #define DEMO_HH_VELOCITY                     110
@@ -546,6 +547,29 @@ static int pick_random_any_patch(char *out_path, size_t out_path_capacity,
   return pick_random_patch(out_path, out_path_capacity, name_looks_like_any, exclude_full_path);
 }
 
+typedef enum {
+  PATCH_VOICE_KICK = 0,
+  PATCH_VOICE_SNARE = 1,
+  PATCH_VOICE_HIHAT = 2,
+  PATCH_VOICE_ANY = 3
+} patch_voice_t;
+
+static int pick_random_patch_for_voice(patch_voice_t voice, char *out_path,
+                                       size_t out_path_capacity, const char *exclude_full_path) {
+  switch (voice) {
+  case PATCH_VOICE_KICK:
+    return pick_random_kick_patch_excluding(out_path, out_path_capacity, exclude_full_path);
+  case PATCH_VOICE_SNARE:
+    return pick_random_snare_patch(out_path, out_path_capacity, exclude_full_path);
+  case PATCH_VOICE_HIHAT:
+    return pick_random_hihat_patch(out_path, out_path_capacity, exclude_full_path);
+  case PATCH_VOICE_ANY:
+    return pick_random_any_patch(out_path, out_path_capacity, exclude_full_path);
+  default:
+    return 0;
+  }
+}
+
 static int read_text_file(const char *path, char **out_text, size_t *out_len) {
   FILE *fp = fopen(path, "rb");
   long file_size;
@@ -626,6 +650,42 @@ static int load_patch_from_mtdrum(const char *path, po32_patch_params_t *out_par
   return status == PO32_OK;
 }
 
+static int refresh_unmorphed_patch(patch_voice_t voice, po32_patch_params_t *patch_to_replace,
+                                   char *replace_path, int *replace_has_path,
+                                   const char *active_other_path, const char *old_path_to_avoid) {
+  char candidate_path[DEMO_PATH_MAX];
+  size_t attempts = 0u;
+  while (attempts < 16u) {
+    attempts++;
+    if (!pick_random_patch_for_voice(voice, candidate_path, sizeof(candidate_path),
+                                     active_other_path))
+      return 0;
+    if (old_path_to_avoid != NULL && strcmp(candidate_path, old_path_to_avoid) == 0)
+      continue;
+    if (!load_patch_from_mtdrum(candidate_path, patch_to_replace))
+      continue;
+    memcpy(replace_path, candidate_path, strlen(candidate_path) + 1u);
+    *replace_has_path = 1;
+    return 1;
+  }
+  return 0;
+}
+
+typedef enum {
+  MORPH_ENDPOINT_NONE = 0,
+  MORPH_ENDPOINT_A = 1,
+  MORPH_ENDPOINT_B = 2
+} morph_endpoint_t;
+
+static morph_endpoint_t morph_endpoint_from_value(float morph) {
+  const float epsilon = 1e-6f;
+  if (morph <= epsilon)
+    return MORPH_ENDPOINT_A;
+  if (morph >= 1.0f - epsilon)
+    return MORPH_ENDPOINT_B;
+  return MORPH_ENDPOINT_NONE;
+}
+
 static float hh_morph_for_step(size_t step_index) {
   uint8_t phase = (uint8_t)(step_index % 8u);
   if (phase <= 4u)
@@ -663,7 +723,8 @@ static float lerp01(float a, float b, float t) {
 static void print_usage(const char *program_name) {
   fprintf(stderr,
           "usage: %s [--sample-rate 96000] [--bpm 160] [--num 8] [--fill 0.25] "
-          "[--syncopation 0.1] [--kick -3] [--snare -2] [--hihat -6] [--any -4] [output.wav] "
+          "[--syncopation 0.1] [--swap-prob 0.0] [--kick -3] [--snare -2] [--hihat -6] "
+          "[--any -4] [output.wav] "
           "[kick_patch.mtdrum] [snare_patch.mtdrum] [hh_a.mtdrum] [hh_b.mtdrum] "
           "[any_a.mtdrum] [any_b.mtdrum]\n",
           program_name);
@@ -675,7 +736,15 @@ static void print_usage(const char *program_name) {
           (double)DEMO_DEFAULT_FILL_PROBABILITY);
   fprintf(stderr, "  --syncopation must be between 0.0 and 1.0 (default %.2f)\n",
           (double)DEMO_DEFAULT_SYNCOPATION_PROBABILITY);
+  fprintf(stderr, "  --swap-prob must be between 0.0 and 1.0 (default %.2f)\n",
+          (double)DEMO_DEFAULT_SWAP_PROBABILITY);
   fprintf(stderr, "  --kick/--snare/--hihat/--any are dB trims (default 0.0 dB)\n");
+}
+
+static const char *patch_source_label(int has_path, const char *path) {
+  if (has_path && path[0] != '\0')
+    return path;
+  return "built-in fallback";
 }
 
 static void interpolate_patch_params(const po32_patch_params_t *a, const po32_patch_params_t *b,
@@ -722,6 +791,7 @@ int main(int argc, char **argv) {
   size_t sequence_count = DEMO_DEFAULT_SEQUENCE_COUNT;
   float fill_probability = DEMO_DEFAULT_FILL_PROBABILITY;
   float syncopation_probability = DEMO_DEFAULT_SYNCOPATION_PROBABILITY;
+  float swap_probability = DEMO_DEFAULT_SWAP_PROBABILITY;
   float kick_db = 0.0f;
   float snare_db = 0.0f;
   float hihat_db = 0.0f;
@@ -741,15 +811,34 @@ int main(int argc, char **argv) {
   char random_hh_patch_b_path[DEMO_PATH_MAX];
   char random_any_patch_a_path[DEMO_PATH_MAX];
   char random_any_patch_b_path[DEMO_PATH_MAX];
-
-  int using_random_kick_patch_a = 0;
-  int using_random_kick_patch_b = 0;
-  int using_random_snare_patch_a = 0;
-  int using_random_snare_patch_b = 0;
-  int using_random_hh_patch_a = 0;
-  int using_random_hh_patch_b = 0;
-  int using_random_any_patch_a = 0;
-  int using_random_any_patch_b = 0;
+  char kick_a_path[DEMO_PATH_MAX] = {0};
+  char kick_b_path[DEMO_PATH_MAX] = {0};
+  char snare_a_path[DEMO_PATH_MAX] = {0};
+  char snare_b_path[DEMO_PATH_MAX] = {0};
+  char hihat_a_path[DEMO_PATH_MAX] = {0};
+  char hihat_b_path[DEMO_PATH_MAX] = {0};
+  char any_a_path[DEMO_PATH_MAX] = {0};
+  char any_b_path[DEMO_PATH_MAX] = {0};
+  int kick_a_has_path = 0;
+  int kick_b_has_path = 0;
+  int snare_a_has_path = 0;
+  int snare_b_has_path = 0;
+  int hihat_a_has_path = 0;
+  int hihat_b_has_path = 0;
+  int any_a_has_path = 0;
+  int any_b_has_path = 0;
+  size_t kick_a_swaps = 0u;
+  size_t kick_b_swaps = 0u;
+  size_t snare_a_swaps = 0u;
+  size_t snare_b_swaps = 0u;
+  size_t hihat_a_swaps = 0u;
+  size_t hihat_b_swaps = 0u;
+  size_t any_a_swaps = 0u;
+  size_t any_b_swaps = 0u;
+  morph_endpoint_t kick_prev_endpoint = morph_endpoint_from_value(kick_morph_for_step(0u));
+  morph_endpoint_t snare_prev_endpoint = morph_endpoint_from_value(snare_morph_for_step(0u));
+  morph_endpoint_t hihat_prev_endpoint = morph_endpoint_from_value(hh_morph_for_step(0u));
+  morph_endpoint_t any_prev_endpoint = morph_endpoint_from_value(any_morph_for_step(0u));
 
   po32_synth_t synth;
   po32_patch_params_t kick_a;
@@ -841,6 +930,38 @@ int main(int argc, char **argv) {
         return 1;
       }
       sample_rate_hz = (uint32_t)parsed;
+      continue;
+    }
+
+    if (strcmp(arg, "--swap-prob") == 0 || strcmp(arg, "--swap") == 0) {
+      float parsed = 0.0f;
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "missing value for %s\n", arg);
+        print_usage(argv[0]);
+        return 1;
+      }
+      if (!parse_float_value(argv[++argi], &parsed) || parsed < 0.0f || parsed > 1.0f) {
+        fprintf(stderr, "invalid %s value: %s\n", arg, argv[argi]);
+        print_usage(argv[0]);
+        return 1;
+      }
+      swap_probability = parsed;
+      continue;
+    }
+
+    if (strncmp(arg, "--swap-prob=", 12u) == 0 || strncmp(arg, "--swap=", 7u) == 0) {
+      const char *value = NULL;
+      float parsed = 0.0f;
+      if (strncmp(arg, "--swap-prob=", 12u) == 0)
+        value = arg + 12;
+      else
+        value = arg + 7;
+      if (!parse_float_value(value, &parsed) || parsed < 0.0f || parsed > 1.0f) {
+        fprintf(stderr, "invalid swap probability value: %s\n", value);
+        print_usage(argv[0]);
+        return 1;
+      }
+      swap_probability = parsed;
       continue;
     }
 
@@ -1077,10 +1198,13 @@ int main(int argc, char **argv) {
       fprintf(stderr, "failed to parse kick patch A file: %s\n", kick_patch_a_arg);
       return 1;
     }
+    memcpy(kick_a_path, kick_patch_a_arg, strlen(kick_patch_a_arg) + 1u);
+    kick_a_has_path = 1;
   } else if (pick_random_kick_patch(random_kick_patch_a_path, sizeof(random_kick_patch_a_path)) &&
              load_patch_from_mtdrum(random_kick_patch_a_path, &kick_a)) {
     kick_patch_a_arg = random_kick_patch_a_path;
-    using_random_kick_patch_a = 1;
+    memcpy(kick_a_path, random_kick_patch_a_path, strlen(random_kick_patch_a_path) + 1u);
+    kick_a_has_path = 1;
   } else {
     make_kick_patch(&kick_a);
   }
@@ -1089,7 +1213,8 @@ int main(int argc, char **argv) {
                                        kick_patch_a_arg) &&
       load_patch_from_mtdrum(random_kick_patch_b_path, &kick_b)) {
     kick_patch_b_arg = random_kick_patch_b_path;
-    using_random_kick_patch_b = 1;
+    memcpy(kick_b_path, random_kick_patch_b_path, strlen(random_kick_patch_b_path) + 1u);
+    kick_b_has_path = 1;
   } else {
     make_kick_patch_b(&kick_b);
   }
@@ -1099,11 +1224,14 @@ int main(int argc, char **argv) {
       fprintf(stderr, "failed to parse snare patch A file: %s\n", snare_patch_a_arg);
       return 1;
     }
+    memcpy(snare_a_path, snare_patch_a_arg, strlen(snare_patch_a_arg) + 1u);
+    snare_a_has_path = 1;
   } else if (pick_random_snare_patch(random_snare_patch_a_path, sizeof(random_snare_patch_a_path),
                                      NULL) &&
              load_patch_from_mtdrum(random_snare_patch_a_path, &snare_a)) {
     snare_patch_a_arg = random_snare_patch_a_path;
-    using_random_snare_patch_a = 1;
+    memcpy(snare_a_path, random_snare_patch_a_path, strlen(random_snare_patch_a_path) + 1u);
+    snare_a_has_path = 1;
   } else {
     make_snare_patch(&snare_a);
   }
@@ -1112,7 +1240,8 @@ int main(int argc, char **argv) {
                               snare_patch_a_arg) &&
       load_patch_from_mtdrum(random_snare_patch_b_path, &snare_b)) {
     snare_patch_b_arg = random_snare_patch_b_path;
-    using_random_snare_patch_b = 1;
+    memcpy(snare_b_path, random_snare_patch_b_path, strlen(random_snare_patch_b_path) + 1u);
+    snare_b_has_path = 1;
   } else {
     make_snare_patch_b(&snare_b);
   }
@@ -1122,11 +1251,14 @@ int main(int argc, char **argv) {
       fprintf(stderr, "failed to parse hihat A patch file: %s\n", hh_patch_a_arg);
       return 1;
     }
+    memcpy(hihat_a_path, hh_patch_a_arg, strlen(hh_patch_a_arg) + 1u);
+    hihat_a_has_path = 1;
   } else if (pick_random_hihat_patch(random_hh_patch_a_path, sizeof(random_hh_patch_a_path),
                                      NULL) &&
              load_patch_from_mtdrum(random_hh_patch_a_path, &hh_a)) {
     hh_patch_a_arg = random_hh_patch_a_path;
-    using_random_hh_patch_a = 1;
+    memcpy(hihat_a_path, random_hh_patch_a_path, strlen(random_hh_patch_a_path) + 1u);
+    hihat_a_has_path = 1;
   } else {
     make_hh_patch_a(&hh_a);
   }
@@ -1136,11 +1268,14 @@ int main(int argc, char **argv) {
       fprintf(stderr, "failed to parse hihat B patch file: %s\n", hh_patch_b_arg);
       return 1;
     }
+    memcpy(hihat_b_path, hh_patch_b_arg, strlen(hh_patch_b_arg) + 1u);
+    hihat_b_has_path = 1;
   } else if (pick_random_hihat_patch(random_hh_patch_b_path, sizeof(random_hh_patch_b_path),
                                      hh_patch_a_arg) &&
              load_patch_from_mtdrum(random_hh_patch_b_path, &hh_b)) {
     hh_patch_b_arg = random_hh_patch_b_path;
-    using_random_hh_patch_b = 1;
+    memcpy(hihat_b_path, random_hh_patch_b_path, strlen(random_hh_patch_b_path) + 1u);
+    hihat_b_has_path = 1;
   } else {
     make_hh_patch_b(&hh_b);
   }
@@ -1150,11 +1285,14 @@ int main(int argc, char **argv) {
       fprintf(stderr, "failed to parse any A patch file: %s\n", any_patch_a_arg);
       return 1;
     }
+    memcpy(any_a_path, any_patch_a_arg, strlen(any_patch_a_arg) + 1u);
+    any_a_has_path = 1;
   } else if (pick_random_any_patch(random_any_patch_a_path, sizeof(random_any_patch_a_path),
                                    NULL) &&
              load_patch_from_mtdrum(random_any_patch_a_path, &any_a)) {
     any_patch_a_arg = random_any_patch_a_path;
-    using_random_any_patch_a = 1;
+    memcpy(any_a_path, random_any_patch_a_path, strlen(random_any_patch_a_path) + 1u);
+    any_a_has_path = 1;
   } else {
     make_any_patch_a(&any_a);
   }
@@ -1164,11 +1302,14 @@ int main(int argc, char **argv) {
       fprintf(stderr, "failed to parse any B patch file: %s\n", any_patch_b_arg);
       return 1;
     }
+    memcpy(any_b_path, any_patch_b_arg, strlen(any_patch_b_arg) + 1u);
+    any_b_has_path = 1;
   } else if (pick_random_any_patch(random_any_patch_b_path, sizeof(random_any_patch_b_path),
                                    any_patch_a_arg) &&
              load_patch_from_mtdrum(random_any_patch_b_path, &any_b)) {
     any_patch_b_arg = random_any_patch_b_path;
-    using_random_any_patch_b = 1;
+    memcpy(any_b_path, random_any_patch_b_path, strlen(random_any_patch_b_path) + 1u);
+    any_b_has_path = 1;
   } else {
     make_any_patch_b(&any_b);
   }
@@ -1244,12 +1385,97 @@ int main(int argc, char **argv) {
     size_t step_index = step % base_steps;
     uint8_t step16 = (uint8_t)(step_index % DEMO_SEQUENCE_STEPS);
     size_t start = step * step_samples;
+    float kick_morph = kick_morph_for_step(step);
+    float snare_morph = snare_morph_for_step(step);
+    float hihat_morph = hh_morph_for_step(step_index);
+    float any_morph = any_morph_for_step(step_index);
+    int is_silent_step = silence_steps[step_index] != 0u;
+    morph_endpoint_t endpoint;
 
-    if (silence_steps[step_index] != 0u)
+    endpoint = morph_endpoint_from_value(kick_morph);
+    if (endpoint != MORPH_ENDPOINT_NONE && endpoint != kick_prev_endpoint) {
+      if (chance_probability(swap_probability)) {
+        if (endpoint == MORPH_ENDPOINT_B) {
+          if (refresh_unmorphed_patch(PATCH_VOICE_KICK, &kick_a, kick_a_path, &kick_a_has_path,
+                                      kick_b_has_path ? kick_b_path : NULL,
+                                      kick_a_has_path ? kick_a_path : NULL)) {
+            ++kick_a_swaps;
+          }
+        } else {
+          if (refresh_unmorphed_patch(PATCH_VOICE_KICK, &kick_b, kick_b_path, &kick_b_has_path,
+                                      kick_a_has_path ? kick_a_path : NULL,
+                                      kick_b_has_path ? kick_b_path : NULL)) {
+            ++kick_b_swaps;
+          }
+        }
+      }
+    }
+    kick_prev_endpoint = endpoint;
+
+    endpoint = morph_endpoint_from_value(snare_morph);
+    if (endpoint != MORPH_ENDPOINT_NONE && endpoint != snare_prev_endpoint) {
+      if (chance_probability(swap_probability)) {
+        if (endpoint == MORPH_ENDPOINT_B) {
+          if (refresh_unmorphed_patch(PATCH_VOICE_SNARE, &snare_a, snare_a_path, &snare_a_has_path,
+                                      snare_b_has_path ? snare_b_path : NULL,
+                                      snare_a_has_path ? snare_a_path : NULL)) {
+            ++snare_a_swaps;
+          }
+        } else {
+          if (refresh_unmorphed_patch(PATCH_VOICE_SNARE, &snare_b, snare_b_path, &snare_b_has_path,
+                                      snare_a_has_path ? snare_a_path : NULL,
+                                      snare_b_has_path ? snare_b_path : NULL)) {
+            ++snare_b_swaps;
+          }
+        }
+      }
+    }
+    snare_prev_endpoint = endpoint;
+
+    endpoint = morph_endpoint_from_value(hihat_morph);
+    if (endpoint != MORPH_ENDPOINT_NONE && endpoint != hihat_prev_endpoint) {
+      if (chance_probability(swap_probability)) {
+        if (endpoint == MORPH_ENDPOINT_B) {
+          if (refresh_unmorphed_patch(PATCH_VOICE_HIHAT, &hh_a, hihat_a_path, &hihat_a_has_path,
+                                      hihat_b_has_path ? hihat_b_path : NULL,
+                                      hihat_a_has_path ? hihat_a_path : NULL)) {
+            ++hihat_a_swaps;
+          }
+        } else {
+          if (refresh_unmorphed_patch(PATCH_VOICE_HIHAT, &hh_b, hihat_b_path, &hihat_b_has_path,
+                                      hihat_a_has_path ? hihat_a_path : NULL,
+                                      hihat_b_has_path ? hihat_b_path : NULL)) {
+            ++hihat_b_swaps;
+          }
+        }
+      }
+    }
+    hihat_prev_endpoint = endpoint;
+
+    endpoint = morph_endpoint_from_value(any_morph);
+    if (endpoint != MORPH_ENDPOINT_NONE && endpoint != any_prev_endpoint) {
+      if (chance_probability(swap_probability)) {
+        if (endpoint == MORPH_ENDPOINT_B) {
+          if (refresh_unmorphed_patch(PATCH_VOICE_ANY, &any_a, any_a_path, &any_a_has_path,
+                                      any_b_has_path ? any_b_path : NULL,
+                                      any_a_has_path ? any_a_path : NULL)) {
+            ++any_a_swaps;
+          }
+        } else {
+          if (refresh_unmorphed_patch(PATCH_VOICE_ANY, &any_b, any_b_path, &any_b_has_path,
+                                      any_a_has_path ? any_a_path : NULL,
+                                      any_b_has_path ? any_b_path : NULL)) {
+            ++any_b_swaps;
+          }
+        }
+      }
+    }
+    any_prev_endpoint = endpoint;
+
+    if (is_silent_step)
       continue;
 
     if (kick_steps[step_index] != 0u) {
-      float kick_morph = kick_morph_for_step(step);
       interpolate_patch_params(&kick_a, &kick_b, kick_morph, &kick_step_patch);
       status = po32_synth_render(&synth, &kick_step_patch, DEMO_KICK_VELOCITY, DEMO_HIT_SECONDS,
                                  kick_hit, hit_capacity, &kick_len);
@@ -1273,7 +1499,6 @@ int main(int argc, char **argv) {
     }
 
     if (snare_steps[step_index] != 0u) {
-      float snare_morph = snare_morph_for_step(step);
       interpolate_patch_params(&snare_a, &snare_b, snare_morph, &snare_step_patch);
       status = po32_synth_render(&synth, &snare_step_patch, DEMO_SNARE_VELOCITY, DEMO_HIT_SECONDS,
                                  snare_hit, hit_capacity, &snare_step_len);
@@ -1297,8 +1522,7 @@ int main(int argc, char **argv) {
     }
 
     if (hihat_steps[step_index] != 0u) {
-      float morph = hh_morph_for_step(step_index);
-      interpolate_patch_params(&hh_a, &hh_b, morph, &hh_step_patch);
+      interpolate_patch_params(&hh_a, &hh_b, hihat_morph, &hh_step_patch);
       status = po32_synth_render(&synth, &hh_step_patch, DEMO_HH_VELOCITY, DEMO_HH_SECONDS, hh_hit,
                                  hh_capacity, &hh_len);
       if (status != PO32_OK) {
@@ -1321,8 +1545,7 @@ int main(int argc, char **argv) {
     }
 
     if (is_any_step(step16)) {
-      float morph = any_morph_for_step(step_index);
-      interpolate_patch_params(&any_a, &any_b, morph, &any_step_patch);
+      interpolate_patch_params(&any_a, &any_b, any_morph, &any_step_patch);
       status = po32_synth_render(&synth, &any_step_patch, DEMO_ANY_VELOCITY, DEMO_ANY_SECONDS,
                                  any_hit, any_capacity, &any_len);
       if (status != PO32_OK) {
@@ -1395,72 +1618,22 @@ int main(int argc, char **argv) {
   printf("any morph: ANY A -> ANY B over 8 steps (repeats every 8 steps)\n");
   printf("syncopation: %zu/%u base steps forced silent (configured %.1f%% dropout)\n",
          silence_count, (unsigned)base_steps, (double)(syncopation_probability * 100.0f));
+  printf("swap probability: %.1f%% when a morph endpoint is reached\n",
+         (double)(swap_probability * 100.0f));
   printf("mix trim: kick %.1f dB, snare %.1f dB, hihat %.1f dB, any %.1f dB\n", (double)kick_db,
          (double)snare_db, (double)hihat_db, (double)any_db);
-
-  if (using_random_kick_patch_a) {
-    printf("kick A patch: random from %s\n", kick_patch_a_arg);
-  } else if (kick_patch_a_arg != NULL) {
-    printf("kick A patch: %s\n", kick_patch_a_arg);
-  } else {
-    printf("kick A patch: built-in fallback\n");
-  }
-
-  if (using_random_kick_patch_b) {
-    printf("kick B patch: random from %s\n", kick_patch_b_arg);
-  } else if (kick_patch_b_arg != NULL) {
-    printf("kick B patch: %s\n", kick_patch_b_arg);
-  } else {
-    printf("kick B patch: built-in fallback\n");
-  }
-
-  if (using_random_snare_patch_a) {
-    printf("snare A patch: random from %s\n", snare_patch_a_arg);
-  } else if (snare_patch_a_arg != NULL) {
-    printf("snare A patch: %s\n", snare_patch_a_arg);
-  } else {
-    printf("snare A patch: built-in fallback\n");
-  }
-
-  if (using_random_snare_patch_b) {
-    printf("snare B patch: random from %s\n", snare_patch_b_arg);
-  } else if (snare_patch_b_arg != NULL) {
-    printf("snare B patch: %s\n", snare_patch_b_arg);
-  } else {
-    printf("snare B patch: built-in fallback\n");
-  }
-
-  if (using_random_hh_patch_a) {
-    printf("hihat A patch: random from %s\n", hh_patch_a_arg);
-  } else if (hh_patch_a_arg != NULL) {
-    printf("hihat A patch: %s\n", hh_patch_a_arg);
-  } else {
-    printf("hihat A patch: built-in fallback\n");
-  }
-
-  if (using_random_hh_patch_b) {
-    printf("hihat B patch: random from %s\n", hh_patch_b_arg);
-  } else if (hh_patch_b_arg != NULL) {
-    printf("hihat B patch: %s\n", hh_patch_b_arg);
-  } else {
-    printf("hihat B patch: built-in fallback\n");
-  }
-
-  if (using_random_any_patch_a) {
-    printf("any A patch: random from %s\n", any_patch_a_arg);
-  } else if (any_patch_a_arg != NULL) {
-    printf("any A patch: %s\n", any_patch_a_arg);
-  } else {
-    printf("any A patch: built-in fallback\n");
-  }
-
-  if (using_random_any_patch_b) {
-    printf("any B patch: random from %s\n", any_patch_b_arg);
-  } else if (any_patch_b_arg != NULL) {
-    printf("any B patch: %s\n", any_patch_b_arg);
-  } else {
-    printf("any B patch: built-in fallback\n");
-  }
+  printf("kick patches: A=%s, B=%s (A swaps=%zu, B swaps=%zu)\n",
+         patch_source_label(kick_a_has_path, kick_a_path),
+         patch_source_label(kick_b_has_path, kick_b_path), kick_a_swaps, kick_b_swaps);
+  printf("snare patches: A=%s, B=%s (A swaps=%zu, B swaps=%zu)\n",
+         patch_source_label(snare_a_has_path, snare_a_path),
+         patch_source_label(snare_b_has_path, snare_b_path), snare_a_swaps, snare_b_swaps);
+  printf("hihat patches: A=%s, B=%s (A swaps=%zu, B swaps=%zu)\n",
+         patch_source_label(hihat_a_has_path, hihat_a_path),
+         patch_source_label(hihat_b_has_path, hihat_b_path), hihat_a_swaps, hihat_b_swaps);
+  printf("any patches: A=%s, B=%s (A swaps=%zu, B swaps=%zu)\n",
+         patch_source_label(any_a_has_path, any_a_path),
+         patch_source_label(any_b_has_path, any_b_path), any_a_swaps, any_b_swaps);
 
   printf("duration: %.3f s (%zu samples @ %u Hz)\n", (double)output_len / (double)sample_rate_hz,
          output_len, (unsigned)sample_rate_hz);

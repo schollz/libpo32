@@ -4,11 +4,12 @@ build/core/po32_kick_sequence_demo \
   --sr 96000 \
   --kick 0 \
   --snare -6 \
-  --hihat -8 \
-  --any -12 \
+  --swap-prob 0.05 \
+  --hihat -12 \
+  --any -24 \
   --bpm 170 \
   --num 16 \
-  --fill 0.5 \
+  --fill 0.3 \
   --syncopation 0.15 \
   demo_kick_160bpm.wav
 
