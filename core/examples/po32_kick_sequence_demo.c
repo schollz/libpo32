@@ -25,6 +25,7 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,21 +33,21 @@
 #include <time.h>
 #include <unistd.h>
 
-#define DEMO_SAMPLE_RATE                    44100u
-#define DEMO_SEQUENCE_STEPS                 16u
-#define DEMO_DEFAULT_SEQUENCE_COUNT         8u
-#define DEMO_DEFAULT_BPM                    160.0f
+#define DEMO_SAMPLE_RATE                     44100u
+#define DEMO_SEQUENCE_STEPS                  16u
+#define DEMO_DEFAULT_SEQUENCE_COUNT          8u
+#define DEMO_DEFAULT_BPM                     160.0f
 #define DEMO_DEFAULT_SYNCOPATION_PROBABILITY 0.10f
-#define DEMO_DEFAULT_FILL_PROBABILITY       0.25f
-#define DEMO_KICK_VELOCITY                  120
-#define DEMO_SNARE_VELOCITY                 118
-#define DEMO_HH_VELOCITY                    110
-#define DEMO_ANY_VELOCITY                   114
-#define DEMO_HIT_SECONDS                    0.50f
-#define DEMO_HH_SECONDS                     0.25f
-#define DEMO_ANY_SECONDS                    0.40f
-#define DEMO_PATCH_DIR                      "/Library/Audio/Presets/Sonic Charge/Microtonic Drum Patches/All"
-#define DEMO_PATH_MAX                       4096u
+#define DEMO_DEFAULT_FILL_PROBABILITY        0.25f
+#define DEMO_KICK_VELOCITY                   120
+#define DEMO_SNARE_VELOCITY                  118
+#define DEMO_HH_VELOCITY                     110
+#define DEMO_ANY_VELOCITY                    114
+#define DEMO_HIT_SECONDS                     0.50f
+#define DEMO_HH_SECONDS                      0.25f
+#define DEMO_ANY_SECONDS                     0.40f
+#define DEMO_PATCH_DIR "/Library/Audio/Presets/Sonic Charge/Microtonic Drum Patches/All"
+#define DEMO_PATH_MAX  4096u
 
 static int write_wav(const char *path, const float *samples, size_t sample_count,
                      uint32_t sample_rate_hz) {
@@ -649,7 +650,8 @@ static void print_usage(const char *program_name) {
   fprintf(stderr, "  --num must be >= 1 (default %u)\n", (unsigned)DEMO_DEFAULT_SEQUENCE_COUNT);
   fprintf(stderr, "  --fill must be between 0.0 and 1.0 (default %.2f)\n",
           (double)DEMO_DEFAULT_FILL_PROBABILITY);
-  fprintf(stderr, "  --syncopation must be between 0.0 and 1.0 (default 0.1)\n");
+  fprintf(stderr, "  --syncopation must be between 0.0 and 1.0 (default %.2f)\n",
+          (double)DEMO_DEFAULT_SYNCOPATION_PROBABILITY);
 }
 
 static void interpolate_patch_params(const po32_patch_params_t *a, const po32_patch_params_t *b,
@@ -1071,6 +1073,11 @@ int main(int argc, char **argv) {
     free(snare_hit);
     free(hh_hit);
     free(any_hit);
+    free(kick_steps);
+    free(snare_steps);
+    free(hihat_steps);
+    free(silence_steps);
+    free(fill_lengths);
     return 1;
   }
 
@@ -1088,6 +1095,11 @@ int main(int argc, char **argv) {
     free(snare_hit);
     free(hh_hit);
     free(any_hit);
+    free(kick_steps);
+    free(snare_steps);
+    free(hihat_steps);
+    free(silence_steps);
+    free(fill_lengths);
     return 1;
   }
 
@@ -1112,6 +1124,11 @@ int main(int argc, char **argv) {
         free(snare_hit);
         free(hh_hit);
         free(any_hit);
+        free(kick_steps);
+        free(snare_steps);
+        free(hihat_steps);
+        free(silence_steps);
+        free(fill_lengths);
         return 1;
       }
       for (size_t i = 0u; i < kick_len && start + i < output_len; ++i)
@@ -1131,6 +1148,11 @@ int main(int argc, char **argv) {
         free(snare_hit);
         free(hh_hit);
         free(any_hit);
+        free(kick_steps);
+        free(snare_steps);
+        free(hihat_steps);
+        free(silence_steps);
+        free(fill_lengths);
         return 1;
       }
       for (size_t i = 0u; i < snare_step_len && start + i < output_len; ++i)
@@ -1150,6 +1172,11 @@ int main(int argc, char **argv) {
         free(snare_hit);
         free(hh_hit);
         free(any_hit);
+        free(kick_steps);
+        free(snare_steps);
+        free(hihat_steps);
+        free(silence_steps);
+        free(fill_lengths);
         return 1;
       }
       for (size_t i = 0u; i < hh_len && start + i < output_len; ++i)
@@ -1169,6 +1196,11 @@ int main(int argc, char **argv) {
         free(snare_hit);
         free(hh_hit);
         free(any_hit);
+        free(kick_steps);
+        free(snare_steps);
+        free(hihat_steps);
+        free(silence_steps);
+        free(fill_lengths);
         return 1;
       }
       for (size_t i = 0u; i < any_len && start + i < output_len; ++i)
@@ -1196,14 +1228,20 @@ int main(int argc, char **argv) {
     free(snare_hit);
     free(hh_hit);
     free(any_hit);
+    free(kick_steps);
+    free(snare_steps);
+    free(hihat_steps);
+    free(silence_steps);
+    free(fill_lengths);
     return 1;
   }
 
   printf("wrote %s\n", wav_path);
   printf("pattern: generated %ux16-step sequences (%u total steps) at %.0f BPM\n",
-         (unsigned)DEMO_SEQUENCE_COUNT, (unsigned)DEMO_TOTAL_STEPS, DEMO_BPM);
-  printf("fill chance: 25%% per 16-step sequence (last 8, 12, or 16 steps)\n");
-  for (uint8_t seq = 0u; seq < DEMO_SEQUENCE_COUNT; ++seq) {
+         (unsigned)sequence_count, (unsigned)total_steps, bpm);
+  printf("fill chance: %.1f%% per 16-step sequence (last 8, 12, or 16 steps)\n",
+         (double)(fill_probability * 100.0f));
+  for (size_t seq = 0u; seq < sequence_count; ++seq) {
     if (fill_lengths[seq] == 0u) {
       printf("  seq %u fill: none\n", (unsigned)(seq + 1u));
     } else {
@@ -1218,7 +1256,7 @@ int main(int argc, char **argv) {
   printf("hihat morph: HH A -> HH B over 4 steps, then back over 4 steps (oscillating)\n");
   printf("any morph: ANY A -> ANY B over 8 steps (repeats every 8 steps)\n");
   printf("syncopation: %zu/%u base steps forced silent (configured %.1f%% dropout)\n",
-         silence_count, DEMO_BASE_STEPS, (double)(syncopation_probability * 100.0f));
+         silence_count, (unsigned)base_steps, (double)(syncopation_probability * 100.0f));
 
   if (using_random_kick_patch_a) {
     printf("kick A patch: random from %s\n", kick_patch_a_arg);
@@ -1292,5 +1330,10 @@ int main(int argc, char **argv) {
   free(snare_hit);
   free(hh_hit);
   free(any_hit);
+  free(kick_steps);
+  free(snare_steps);
+  free(hihat_steps);
+  free(silence_steps);
+  free(fill_lengths);
   return 0;
 }
