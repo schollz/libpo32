@@ -34,6 +34,9 @@ target_link_libraries(po32_example PRIVATE po32)
 add_executable(po32_demo examples/po32_demo.c)
 target_link_libraries(po32_demo PRIVATE po32)
 
+add_executable(po32_kick_sequence_demo examples/po32_kick_sequence_demo.c)
+target_link_libraries(po32_kick_sequence_demo PRIVATE po32)
+
 add_executable(po32_pattern_editor examples/po32_pattern_editor.c)
 target_link_libraries(po32_pattern_editor PRIVATE po32)
 
