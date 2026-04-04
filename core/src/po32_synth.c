@@ -1,18 +1,7 @@
 /*
  * PO-32 drum synthesizer.
  *
- * All transcendentals (sinf, cosf, powf, expf, sqrtf) replaced with
- * lookup tables:
- *
- *   - 2048-entry sine table with linear interpolation
- *   - 256-entry exp2 fractional table + integer bit shift
- *   - log2 via float bit extraction + degree-3 minimax polynomial
- *   - Quake-style fast inverse sqrt + Newton refinement
- *
- * The render loop uses only adds, multiplies, and table lookups.
- * <math.h> is NOT included; only <stdint.h> and <string.h> are needed.
- *
- * Total static table footprint: (2048 + 256) * 4 = ~9 KB.
+ * Uses standard math functions through po32_lut.h wrappers.
  */
 
 #include "po32_synth.h"
@@ -34,25 +23,11 @@
 #define lut_expf   po32_lut_expf
 #define lut_pow10f po32_lut_pow10f
 
-/* sqrtf via Quake inv-sqrt — only used in synth, not worth sharing */
+/* Local sqrt wrapper to keep call sites consistent. */
 static float lut_sqrtf(float x) {
-  union {
-    float f;
-    uint32_t u;
-  } conv;
-  float y, half_x;
-
   if (x <= 0.0f)
     return 0.0f;
-
-  half_x = x * 0.5f;
-  conv.f = x;
-  conv.u = 0x5F375A86u - (conv.u >> 1);
-  y = conv.f;
-  y = y * (1.5f - half_x * y * y);
-  y = y * (1.5f - half_x * y * y);
-
-  return x * y;
+  return sqrtf(x);
 }
 
 /* ── Synth constants ────────────────────────────────────────────── */

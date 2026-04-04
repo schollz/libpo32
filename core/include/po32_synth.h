@@ -5,8 +5,8 @@
  * PO-32 drum synthesizer.
  *
  * Renders drum sounds from po32_patch_params_t parameters.
- * All output is float [-1, 1]. Internally uses lookup tables for all
- * transcendentals (no libm trig required).
+ * All output is float [-1, 1]. Internally uses standard <math.h>
+ * transcendentals.
  */
 
 #include "po32.h"

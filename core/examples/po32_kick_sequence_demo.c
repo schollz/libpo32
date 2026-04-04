@@ -23,7 +23,6 @@
 #include "po32.h"
 #include "po32_synth.h"
 
-#include <ctype.h>
 #include <dirent.h>
 #include <limits.h>
 #include <math.h>
@@ -40,6 +39,9 @@
 #define DEMO_DEFAULT_BPM                     160.0f
 #define DEMO_DEFAULT_SYNCOPATION_PROBABILITY 0.10f
 #define DEMO_DEFAULT_FILL_PROBABILITY        0.25f
+#define DEMO_FILL_EVERY_N_SEQUENCES          4u
+#define DEMO_CHANGE_EVERY_N_SEQUENCES        8u
+#define DEMO_DEFAULT_FOUR_FLOOR_PROBABILITY  0.0f
 #define DEMO_DEFAULT_SWAP_PROBABILITY        0.0f
 #define DEMO_DEFAULT_REVERSE_PROBABILITY     0.0f
 #define DEMO_OSC_FREQ_MIN_HZ                 20.0f
@@ -51,8 +53,14 @@
 #define DEMO_HIT_SECONDS                     0.50f
 #define DEMO_HH_SECONDS                      0.25f
 #define DEMO_ANY_SECONDS                     0.40f
-#define DEMO_PATCH_DIR "/Library/Audio/Presets/Sonic Charge/Microtonic Drum Patches/All"
-#define DEMO_PATH_MAX  4096u
+#define DEMO_PATCH_CATEGORY_DIR   "/Library/Audio/Presets/Sonic Charge/Microtonic Drum Patches/By Category"
+#define DEMO_PATCH_CATEGORY_KICK  "Bass Drum Patches"
+#define DEMO_PATCH_CATEGORY_SNARE "Snare Drum Patches"
+#define DEMO_PATCH_CATEGORY_HIHAT "Hi-hats And Cymbal Patches"
+#define DEMO_KICK_PATCH_DIR       DEMO_PATCH_CATEGORY_DIR "/" DEMO_PATCH_CATEGORY_KICK
+#define DEMO_SNARE_PATCH_DIR      DEMO_PATCH_CATEGORY_DIR "/" DEMO_PATCH_CATEGORY_SNARE
+#define DEMO_HIHAT_PATCH_DIR      DEMO_PATCH_CATEGORY_DIR "/" DEMO_PATCH_CATEGORY_HIHAT
+#define DEMO_PATH_MAX             4096u
 
 static int write_wav(const char *path, const float *samples, size_t sample_count,
                      uint32_t sample_rate_hz) {
@@ -226,10 +234,79 @@ static uint8_t random_fill_length(void) {
   }
 }
 
+static void add_four_on_the_floor_kicks(uint8_t *kick_steps, uint8_t *silence_steps,
+                                         size_t sequence_count, float probability,
+                                         size_t *out_added_count) {
+  static const uint8_t four_floor_offsets[4] = {0u, 4u, 8u, 12u};
+  size_t added_count = 0u;
+
+  if (probability <= 0.0f) {
+    *out_added_count = 0u;
+    return;
+  }
+
+  for (size_t seq = 0u; seq < sequence_count; ++seq) {
+    size_t base = (size_t)seq * DEMO_SEQUENCE_STEPS;
+    for (size_t i = 0u; i < 4u; ++i) {
+      size_t idx = base + four_floor_offsets[i];
+      if (kick_steps[idx] != 0u)
+        continue;
+      if (!chance_probability(probability))
+        continue;
+      kick_steps[idx] = 1u;
+      silence_steps[idx] = 0u;
+      ++added_count;
+    }
+  }
+
+  *out_added_count = added_count;
+}
+
+static void copy_sequence_state(size_t src_seq, size_t dst_seq, uint8_t *kick_steps,
+                                uint8_t *snare_steps, uint8_t *hihat_steps,
+                                uint8_t *silence_steps, uint8_t *fill_lengths) {
+  size_t src_base = src_seq * DEMO_SEQUENCE_STEPS;
+  size_t dst_base = dst_seq * DEMO_SEQUENCE_STEPS;
+  memcpy(kick_steps + dst_base, kick_steps + src_base, DEMO_SEQUENCE_STEPS);
+  memcpy(snare_steps + dst_base, snare_steps + src_base, DEMO_SEQUENCE_STEPS);
+  memcpy(hihat_steps + dst_base, hihat_steps + src_base, DEMO_SEQUENCE_STEPS);
+  memcpy(silence_steps + dst_base, silence_steps + src_base, DEMO_SEQUENCE_STEPS);
+  fill_lengths[dst_seq] = fill_lengths[src_seq];
+}
+
+static void enforce_eight_bar_grouping(uint8_t *kick_steps, uint8_t *snare_steps,
+                                       uint8_t *hihat_steps, uint8_t *silence_steps,
+                                       uint8_t *fill_lengths, size_t sequence_count) {
+  static const uint8_t always_same_offsets[] = {1u, 2u, 4u, 5u, 6u};
+  static const uint8_t variation_offsets[] = {3u, 7u};
+
+  for (size_t group_start = 0u; group_start < sequence_count;
+       group_start += DEMO_CHANGE_EVERY_N_SEQUENCES) {
+    for (size_t i = 0u; i < sizeof(always_same_offsets) / sizeof(always_same_offsets[0]); ++i) {
+      size_t seq = group_start + always_same_offsets[i];
+      if (seq >= sequence_count)
+        continue;
+      copy_sequence_state(group_start, seq, kick_steps, snare_steps, hihat_steps, silence_steps,
+                          fill_lengths);
+    }
+
+    for (size_t i = 0u; i < sizeof(variation_offsets) / sizeof(variation_offsets[0]); ++i) {
+      size_t seq = group_start + variation_offsets[i];
+      if (seq >= sequence_count)
+        continue;
+      if (fill_lengths[seq] == 0u) {
+        copy_sequence_state(group_start, seq, kick_steps, snare_steps, hihat_steps, silence_steps,
+                            fill_lengths);
+      }
+    }
+  }
+}
+
 static void generate_step_patterns(uint8_t *kick_steps, uint8_t *snare_steps, uint8_t *hihat_steps,
                                    uint8_t *fill_lengths, uint8_t *silence_steps,
                                    size_t sequence_count, size_t base_steps, float fill_probability,
-                                   float syncopation_probability) {
+                                   float syncopation_probability,
+                                   float four_floor_probability, size_t *four_floor_added_count) {
   memset(kick_steps, 0, base_steps);
   memset(snare_steps, 0, base_steps);
   memset(hihat_steps, 0, base_steps);
@@ -263,8 +340,8 @@ static void generate_step_patterns(uint8_t *kick_steps, uint8_t *snare_steps, ui
         hihat_steps[base + s] = 1u;
     }
 
-    /* Configurable chance this 16-step block ends in a fill. */
-    if (chance_probability(fill_probability)) {
+    /* Configurable chance this 16-step block ends in a fill on sequence 4, 8, 12, ... */
+    if (((seq + 1u) % DEMO_FILL_EVERY_N_SEQUENCES) == 0u && chance_probability(fill_probability)) {
       fill_len = random_fill_length();
       for (uint8_t s = (uint8_t)(DEMO_SEQUENCE_STEPS - fill_len); s < DEMO_SEQUENCE_STEPS; ++s) {
         size_t idx = base + s;
@@ -340,6 +417,12 @@ static void generate_step_patterns(uint8_t *kick_steps, uint8_t *snare_steps, ui
       }
     }
   }
+
+  add_four_on_the_floor_kicks(kick_steps, silence_steps, sequence_count, four_floor_probability,
+                              four_floor_added_count);
+
+  enforce_eight_bar_grouping(kick_steps, snare_steps, hihat_steps, silence_steps, fill_lengths,
+                             sequence_count);
 }
 
 static void make_kick_patch(po32_patch_params_t *params) {
@@ -504,64 +587,7 @@ static int has_suffix(const char *text, const char *suffix) {
   return strcmp(text + text_len - suffix_len, suffix) == 0;
 }
 
-static int contains_case_insensitive(const char *haystack, const char *needle) {
-  size_t needle_len = strlen(needle);
-  if (needle_len == 0u)
-    return 1;
-
-  for (size_t i = 0u; haystack[i] != '\0'; ++i) {
-    size_t j = 0u;
-    while (j < needle_len && haystack[i + j] != '\0' &&
-           toupper((unsigned char)haystack[i + j]) == toupper((unsigned char)needle[j])) {
-      ++j;
-    }
-    if (j == needle_len)
-      return 1;
-  }
-  return 0;
-}
-
-static int name_looks_like_kick(const char *name) {
-  if (!has_suffix(name, ".mtdrum"))
-    return 0;
-  if (name[0] == '.' || (name[0] == '_' && name[1] == '.'))
-    return 0;
-  if (contains_case_insensitive(name, " BD "))
-    return 1;
-  if (contains_case_insensitive(name, "KICK"))
-    return 1;
-  return 0;
-}
-
-static int name_looks_like_snare(const char *name) {
-  if (!has_suffix(name, ".mtdrum"))
-    return 0;
-  if (name[0] == '.' || (name[0] == '_' && name[1] == '.'))
-    return 0;
-  if (contains_case_insensitive(name, " SD "))
-    return 1;
-  if (contains_case_insensitive(name, "SNARE"))
-    return 1;
-  return 0;
-}
-
-static int name_looks_like_hihat(const char *name) {
-  if (!has_suffix(name, ".mtdrum"))
-    return 0;
-  if (name[0] == '.' || (name[0] == '_' && name[1] == '.'))
-    return 0;
-  if (contains_case_insensitive(name, " HH "))
-    return 1;
-  if (contains_case_insensitive(name, " CH "))
-    return 1;
-  if (contains_case_insensitive(name, " OH "))
-    return 1;
-  if (contains_case_insensitive(name, "HAT"))
-    return 1;
-  return 0;
-}
-
-static int name_looks_like_any(const char *name) {
+static int is_patch_file_name(const char *name) {
   if (!has_suffix(name, ".mtdrum"))
     return 0;
   if (name[0] == '.' || (name[0] == '_' && name[1] == '.'))
@@ -569,11 +595,16 @@ static int name_looks_like_any(const char *name) {
   return 1;
 }
 
-typedef int (*patch_name_match_fn)(const char *name);
+static int category_name_is_excluded_from_any(const char *name) {
+  return strcmp(name, DEMO_PATCH_CATEGORY_KICK) == 0 ||
+         strcmp(name, DEMO_PATCH_CATEGORY_SNARE) == 0 ||
+         strcmp(name, DEMO_PATCH_CATEGORY_HIHAT) == 0;
+}
 
-static int pick_random_patch(char *out_path, size_t out_path_capacity, patch_name_match_fn matcher,
-                             const char *exclude_full_path) {
-  DIR *dir = opendir(DEMO_PATCH_DIR);
+static int pick_random_patch_from_directory(const char *directory_path, char *out_path,
+                                            size_t out_path_capacity,
+                                            const char *exclude_full_path) {
+  DIR *dir = opendir(directory_path);
   struct dirent *entry;
   size_t seen = 0u;
   char chosen[DEMO_PATH_MAX];
@@ -583,15 +614,15 @@ static int pick_random_patch(char *out_path, size_t out_path_capacity, patch_nam
 
   chosen[0] = '\0';
   while ((entry = readdir(dir)) != NULL) {
-    int pick_this = 0;
+    int pick_this;
     char candidate[DEMO_PATH_MAX];
-    if (!matcher(entry->d_name))
+    if (!is_patch_file_name(entry->d_name))
       continue;
-    (void)snprintf(candidate, sizeof(candidate), "%s/%s", DEMO_PATCH_DIR, entry->d_name);
+    (void)snprintf(candidate, sizeof(candidate), "%s/%s", directory_path, entry->d_name);
     if (exclude_full_path != NULL && strcmp(candidate, exclude_full_path) == 0)
       continue;
-    seen++;
-    pick_this = (rand() % (int)seen) == 0;
+    ++seen;
+    pick_this = ((size_t)rand() % seen) == 0u;
     if (pick_this) {
       memcpy(chosen, candidate, strlen(candidate) + 1u);
     }
@@ -606,28 +637,80 @@ static int pick_random_patch(char *out_path, size_t out_path_capacity, patch_nam
   return 1;
 }
 
+static int pick_random_any_patch(char *out_path, size_t out_path_capacity,
+                                 const char *exclude_full_path) {
+  DIR *categories_dir = opendir(DEMO_PATCH_CATEGORY_DIR);
+  struct dirent *category_entry;
+  size_t seen = 0u;
+  char chosen[DEMO_PATH_MAX];
+
+  if (categories_dir == NULL)
+    return 0;
+
+  chosen[0] = '\0';
+  while ((category_entry = readdir(categories_dir)) != NULL) {
+    const char *category_name = category_entry->d_name;
+    char category_path[DEMO_PATH_MAX];
+    DIR *category_dir;
+    struct dirent *patch_entry;
+    if (category_name[0] == '.' || (category_name[0] == '_' && category_name[1] == '.'))
+      continue;
+    if (category_name_is_excluded_from_any(category_name))
+      continue;
+    (void)snprintf(category_path, sizeof(category_path), "%s/%s", DEMO_PATCH_CATEGORY_DIR,
+                   category_name);
+    category_dir = opendir(category_path);
+    if (category_dir == NULL)
+      continue;
+
+    while ((patch_entry = readdir(category_dir)) != NULL) {
+      int pick_this;
+      char candidate[DEMO_PATH_MAX];
+      if (!is_patch_file_name(patch_entry->d_name))
+        continue;
+      (void)snprintf(candidate, sizeof(candidate), "%s/%s", category_path, patch_entry->d_name);
+      if (exclude_full_path != NULL && strcmp(candidate, exclude_full_path) == 0)
+        continue;
+      ++seen;
+      pick_this = ((size_t)rand() % seen) == 0u;
+      if (pick_this) {
+        memcpy(chosen, candidate, strlen(candidate) + 1u);
+      }
+    }
+
+    (void)closedir(category_dir);
+  }
+
+  (void)closedir(categories_dir);
+
+  if (seen == 0u || chosen[0] == '\0')
+    return 0;
+  if (strlen(chosen) + 1u > out_path_capacity)
+    return 0;
+  memcpy(out_path, chosen, strlen(chosen) + 1u);
+  return 1;
+}
+
 static int pick_random_kick_patch(char *out_path, size_t out_path_capacity) {
-  return pick_random_patch(out_path, out_path_capacity, name_looks_like_kick, NULL);
+  return pick_random_patch_from_directory(DEMO_KICK_PATCH_DIR, out_path, out_path_capacity, NULL);
 }
 
 static int pick_random_kick_patch_excluding(char *out_path, size_t out_path_capacity,
                                             const char *exclude_full_path) {
-  return pick_random_patch(out_path, out_path_capacity, name_looks_like_kick, exclude_full_path);
+  return pick_random_patch_from_directory(DEMO_KICK_PATCH_DIR, out_path, out_path_capacity,
+                                          exclude_full_path);
 }
 
 static int pick_random_snare_patch(char *out_path, size_t out_path_capacity,
                                    const char *exclude_full_path) {
-  return pick_random_patch(out_path, out_path_capacity, name_looks_like_snare, exclude_full_path);
+  return pick_random_patch_from_directory(DEMO_SNARE_PATCH_DIR, out_path, out_path_capacity,
+                                          exclude_full_path);
 }
 
 static int pick_random_hihat_patch(char *out_path, size_t out_path_capacity,
                                    const char *exclude_full_path) {
-  return pick_random_patch(out_path, out_path_capacity, name_looks_like_hihat, exclude_full_path);
-}
-
-static int pick_random_any_patch(char *out_path, size_t out_path_capacity,
-                                 const char *exclude_full_path) {
-  return pick_random_patch(out_path, out_path_capacity, name_looks_like_any, exclude_full_path);
+  return pick_random_patch_from_directory(DEMO_HIHAT_PATCH_DIR, out_path, out_path_capacity,
+                                          exclude_full_path);
 }
 
 typedef enum {
@@ -806,7 +889,8 @@ static float lerp01(float a, float b, float t) {
 static void print_usage(const char *program_name) {
   fprintf(stderr,
           "usage: %s [--sample-rate 96000] [--bpm 160] [--num 8] [--fill 0.25] "
-          "[--syncopation 0.1] [--swap-prob 0.0] [--reverse 0.0] [--note 36] "
+          "[--syncopation 0.1] [--four-on-the-floor 0.0] [--swap-prob 0.0] "
+          "[--reverse 0.0] [--note 36] "
           "[--kick -3] [--snare -2] [--hihat -6] [--any -4] [output.wav] "
           "[kick_patch.mtdrum] [snare_patch.mtdrum] [hh_a.mtdrum] [hh_b.mtdrum] "
           "[any_a.mtdrum] [any_b.mtdrum]\n",
@@ -819,6 +903,10 @@ static void print_usage(const char *program_name) {
           (double)DEMO_DEFAULT_FILL_PROBABILITY);
   fprintf(stderr, "  --syncopation must be between 0.0 and 1.0 (default %.2f)\n",
           (double)DEMO_DEFAULT_SYNCOPATION_PROBABILITY);
+  fprintf(stderr,
+          "  --four-on-the-floor/--four-floor must be 0.0..1.0 (default %.2f), "
+          "adds missing kick on steps 1/5/9/13\n",
+          (double)DEMO_DEFAULT_FOUR_FLOOR_PROBABILITY);
   fprintf(stderr, "  --swap-prob must be between 0.0 and 1.0 (default %.2f)\n",
           (double)DEMO_DEFAULT_SWAP_PROBABILITY);
   fprintf(stderr, "  --reverse must be between 0.0 and 1.0 (default %.2f)\n",
@@ -877,6 +965,7 @@ int main(int argc, char **argv) {
   size_t sequence_count = DEMO_DEFAULT_SEQUENCE_COUNT;
   float fill_probability = DEMO_DEFAULT_FILL_PROBABILITY;
   float syncopation_probability = DEMO_DEFAULT_SYNCOPATION_PROBABILITY;
+  float four_floor_probability = DEMO_DEFAULT_FOUR_FLOOR_PROBABILITY;
   float swap_probability = DEMO_DEFAULT_SWAP_PROBABILITY;
   float reverse_probability = DEMO_DEFAULT_REVERSE_PROBABILITY;
   int note_enabled = 0;
@@ -963,6 +1052,7 @@ int main(int argc, char **argv) {
   uint8_t *silence_steps = NULL;
   uint8_t *fill_lengths = NULL;
   size_t silence_count = 0u;
+  size_t four_floor_added_count = 0u;
 
   float *kick_hit = NULL;
   float *snare_hit = NULL;
@@ -1289,6 +1379,43 @@ int main(int argc, char **argv) {
       continue;
     }
 
+    if (strcmp(arg, "--four-on-the-floor") == 0 || strcmp(arg, "--four-floor") == 0 ||
+        strcmp(arg, "--four-floor-prob") == 0) {
+      float parsed = 0.0f;
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "missing value for %s\n", arg);
+        print_usage(argv[0]);
+        return 1;
+      }
+      if (!parse_float_value(argv[++argi], &parsed) || parsed < 0.0f || parsed > 1.0f) {
+        fprintf(stderr, "invalid %s value: %s\n", arg, argv[argi]);
+        print_usage(argv[0]);
+        return 1;
+      }
+      four_floor_probability = parsed;
+      continue;
+    }
+
+    if (strncmp(arg, "--four-on-the-floor=", 20u) == 0 || strncmp(arg, "--four-floor=", 13u) == 0 ||
+        strncmp(arg, "--four-floor-prob=", 18u) == 0) {
+      const char *value = NULL;
+      float parsed = 0.0f;
+      if (strncmp(arg, "--four-on-the-floor=", 20u) == 0) {
+        value = arg + 20;
+      } else if (strncmp(arg, "--four-floor=", 13u) == 0) {
+        value = arg + 13;
+      } else {
+        value = arg + 18;
+      }
+      if (!parse_float_value(value, &parsed) || parsed < 0.0f || parsed > 1.0f) {
+        fprintf(stderr, "invalid four-on-the-floor probability value: %s\n", value);
+        print_usage(argv[0]);
+        return 1;
+      }
+      four_floor_probability = parsed;
+      continue;
+    }
+
     if (arg[0] == '-' && arg[1] != '\0') {
       fprintf(stderr, "unknown option: %s\n", arg);
       print_usage(argv[0]);
@@ -1484,7 +1611,8 @@ int main(int argc, char **argv) {
   }
 
   generate_step_patterns(kick_steps, snare_steps, hihat_steps, fill_lengths, silence_steps,
-                         sequence_count, base_steps, fill_probability, syncopation_probability);
+                         sequence_count, base_steps, fill_probability, syncopation_probability,
+                         four_floor_probability, &four_floor_added_count);
   for (size_t i = 0u; i < base_steps; ++i) {
     if (silence_steps[i] != 0u)
       ++silence_count;
@@ -1773,8 +1901,11 @@ int main(int argc, char **argv) {
   printf("sample rate: %u Hz\n", (unsigned)sample_rate_hz);
   printf("pattern: generated %ux16-step sequences (%u total steps) at %.0f BPM\n",
          (unsigned)sequence_count, (unsigned)total_steps, bpm);
-  printf("fill chance: %.1f%% per 16-step sequence (last 8, 12, or 16 steps)\n",
-         (double)(fill_probability * 100.0f));
+  printf("fill chance: %.1f%% on sequences %u, %u, %u, ... (last 8, 12, or 16 steps)\n",
+         (double)(fill_probability * 100.0f), (unsigned)DEMO_FILL_EVERY_N_SEQUENCES,
+         (unsigned)(DEMO_FILL_EVERY_N_SEQUENCES * 2u), (unsigned)(DEMO_FILL_EVERY_N_SEQUENCES * 3u));
+  printf("sequence grouping: in each 8-sequence block, seq 1/2/3/5/6/7 are identical; "
+         "seq 4 and 8 vary only when their fill chance hits\n");
   for (size_t seq = 0u; seq < sequence_count; ++seq) {
     if (fill_lengths[seq] == 0u) {
       printf("  seq %u fill: none\n", (unsigned)(seq + 1u));
@@ -1791,6 +1922,9 @@ int main(int argc, char **argv) {
   printf("any morph: ANY A -> ANY B over 8 steps (repeats every 8 steps)\n");
   printf("syncopation: %zu/%u base steps forced silent (configured %.1f%% dropout)\n",
          silence_count, (unsigned)base_steps, (double)(syncopation_probability * 100.0f));
+  printf("four-on-the-floor add: %.1f%% chance on missing kick steps 1/5/9/13 "
+         "(added %zu steps)\n",
+         (double)(four_floor_probability * 100.0f), four_floor_added_count);
   printf("swap probability: %.1f%% when a morph endpoint is reached\n",
          (double)(swap_probability * 100.0f));
   printf("reverse probability: %.1f%% per step (reversed steps: %zu/%u)\n",
