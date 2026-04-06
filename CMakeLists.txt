@@ -4,4 +4,3 @@ project(libpo32 VERSION ${PO32_VERSION} LANGUAGES C)
 
 enable_testing()
 add_subdirectory(core)
-add_subdirectory(core_fixed)
